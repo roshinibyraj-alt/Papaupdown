@@ -1,3 +1,1 @@
-Flask==3.0.3
-requests==2.32.3
-py-clob-client==0.34.6
+requests==2.31.0
