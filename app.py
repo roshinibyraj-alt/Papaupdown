@@ -78,7 +78,6 @@ def update_market_context():
     bot_state["time_left_seconds"] = max(0, window_end - now)
 
     # Simulate realistic micro-fluctuations matching standard 15m order books
-    # Drops and rises occur naturally over time
     wave = math.sin(now / 30.0) * 0.15
     noise = (int(now * 13) % 100) / 2000.0
     base_price = 0.50 if bot_state["strategy_direction"] == "UP" else 0.45
@@ -93,16 +92,13 @@ def run_trading_logic():
     direction = bot_state["strategy_direction"]
     price = bot_state["current_price"]
     
-    # Define valid execution range requested by user
     if not (0.05 <= price <= 0.90):
         return
 
-    # Quantize the price into standard 0.05 ladder brackets
     current_level = round(math.floor(price / 0.05) * 0.05, 2)
 
     # Execution path for UP Ladder
     if direction == "UP":
-        # Check if price has fallen to a new or unexecuted 0.05 level
         if current_level not in bot_state["bought_levels"] and len(bot_state["bought_levels"]) < 10:
             cost = 100 * price
             if bot_state["balance"] >= cost:
@@ -114,10 +110,7 @@ def run_trading_logic():
                 bot_state["avg_entry_price"] = round(bot_state["total_spent"] / bot_state["shares_held"], 4)
                 bot_state["target_exit_price"] = round(bot_state["avg_entry_price"] + 0.10, 4)
                 add_log(f"Ladder Buy Filled: 100 shares at {price:.2f} USDC (Level: {current_level:.2f})")
-            else:
-                add_log("Insufficient demo capital to execute next ladder level.")
 
-        # Check for Target Exit (+0.10 from Average Entry)
         if bot_state["shares_held"] > 0 and price >= bot_state["target_exit_price"]:
             revenue = bot_state["shares_held"] * price
             profit = revenue - bot_state["total_spent"]
@@ -132,7 +125,6 @@ def run_trading_logic():
                 "exit_price": price,
                 "pnl": profit
             })
-            # Clear current ladder positions
             bot_state["shares_held"] = 0
             bot_state["total_spent"] = 0.0
             bot_state["avg_entry_price"] = 0.0
@@ -141,9 +133,6 @@ def run_trading_logic():
 
     # Execution path for DOWN Ladder (Perfect Mirror)
     elif direction == "DOWN":
-        # For down ladders, we trade the inverse token contract. 
-        # Price drops on the underlying asset mean the DOWN contract price goes up.
-        # We mirror the step logic by treating lower asset contract pricing as our trigger.
         if current_level not in bot_state["bought_levels"] and len(bot_state["bought_levels"]) < 10:
             cost = 100 * price
             if bot_state["balance"] >= cost:
@@ -185,10 +174,9 @@ def background_loop():
             print(f"Engine Error: {e}")
         time.sleep(2)
 
-# Start execution loop in background
 Thread(target=background_loop, daemon=True).start()
 
-# --- WEB DASHBOARD FRONTEND ---
+# --- FIXED WEB DASHBOARD FRONTEND ---
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -201,42 +189,39 @@ DASHBOARD_HTML = """
 <body class="bg-slate-950 text-slate-100 font-sans min-h-screen p-6">
     <div class="max-w-6xl mx-auto space-y-6">
         
-        <!-- Header Panel -->
         <div class="flex justify-between items-center bg-slate-900 border border-slate-800 p-6 rounded-xl shadow-lg">
             <div>
                 <h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
                     <span class="h-3 w-3 bg-emerald-500 rounded-full animate-pulse"></span>
                     Polymarket BTC 15m Real-Time Demo
                 </h1>
-                <p class="text-slate-400 text-sm mt-1">Deterministic Path: <span class="font-mono text-indigo-400">btc-updown-15m-{ current_window_end }</span></p>
+                <p class="text-slate-400 text-sm mt-1">Deterministic Path: <span class="font-mono text-indigo-400">btc-updown-15m-{{ current_window_end }}</span></p>
             </div>
             <div class="text-right">
                 <p class="text-xs font-semibold uppercase tracking-wider text-slate-500">Window Closes In</p>
-                <p class="text-3xl font-mono font-bold text-amber-400">{ time_left }</p>
+                <p class="text-3xl font-mono font-bold text-amber-400">{{ time_left }}</p>
             </div>
         </div>
 
-        <!-- Metric Grid -->
         <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl">
                 <p class="text-xs font-semibold uppercase text-slate-500">Available Capital</p>
-                <p class="text-2xl font-bold font-mono text-emerald-400 mt-1">${ balance }</p>
+                <p class="text-2xl font-bold font-mono text-emerald-400 mt-1">${{ balance }}</p>
             </div>
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl">
                 <p class="text-xs font-semibold uppercase text-slate-500">Total Net Profit</p>
-                <p class="text-2xl font-bold font-mono { pnl_color } mt-1">${ net_pnl }</p>
+                <p class="text-2xl font-bold font-mono {{ pnl_color }} mt-1">${{ net_pnl }}</p>
             </div>
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl">
                 <p class="text-xs font-semibold uppercase text-slate-500">Active Bias</p>
-                <p class="text-2xl font-bold mt-1 { bias_color }">{ direction }</p>
+                <p class="text-2xl font-bold mt-1 {{ bias_color }}">{{ direction }}</p>
             </div>
             <div class="bg-slate-900 border border-slate-800 p-5 rounded-xl">
                 <p class="text-xs font-semibold uppercase text-slate-500">Current Token Cost</p>
-                <p class="text-2xl font-bold font-mono text-blue-400 mt-1">${ current_price }</p>
+                <p class="text-2xl font-bold font-mono text-blue-400 mt-1">${{ current_price }}</p>
             </div>
         </div>
 
-        <!-- Position Breakdown -->
         <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div class="md:col-span-2 bg-slate-900 border border-slate-800 p-6 rounded-xl space-y-4">
                 <h2 class="text-lg font-bold text-white border-b border-slate-800 pb-2">Active Ladder Status</h2>
@@ -263,14 +248,13 @@ DASHBOARD_HTML = """
                 {% endif %}
             </div>
 
-            <!-- Trade History Overview -->
             <div class="bg-slate-900 border border-slate-800 p-6 rounded-xl flex flex-col">
                 <h2 class="text-lg font-bold text-white border-b border-slate-800 pb-2 mb-3">Session Performance</h2>
                 <div class="flex-1 overflow-y-auto max-h-[160px] space-y-2 pr-1 text-xs font-mono">
                     {% for trade in history %}
                     <div class="flex justify-between items-center bg-slate-950 p-2 rounded border border-slate-850">
                         <div>
-                            <span class="text-slate-400 font-bold">[{{ trade.window }}]</span> 
+                            <span class="text-slate-400 font-bold">Ref: {{ trade.window }}</span> 
                             <span class="text-slate-500">Side:</span> {{ trade.direction }}
                         </div>
                         <div class="{% if trade.pnl >= 0 %}text-emerald-400{% else %}text-rose-400{% endif %} font-bold">
@@ -284,7 +268,6 @@ DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- System Console Logs -->
         <div class="bg-slate-900 border border-slate-800 p-6 rounded-xl">
             <h2 class="text-lg font-bold text-white border-b border-slate-800 pb-2 mb-3">Live Execution Console Log</h2>
             <div class="bg-slate-950 p-4 rounded-lg h-48 overflow-y-auto border border-slate-850 font-mono text-xs space-y-1.5 text-slate-300">
@@ -329,6 +312,5 @@ def index():
     )
 
 if __name__ == "__main__":
-    # Pull dynamic hosting port assigned by Railway
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
