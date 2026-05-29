@@ -28,22 +28,29 @@ def log_update(message):
     print(message)
     state["latest_log"] = message
 
-def check_binance_candle():
-    """Checks the Binance.US 15-minute BTC candle to bypass geo-blocks."""
+def check_previous_candle_trend():
+    """Checks the Bybit 15-minute BTC candle to bypass Binance Cloudflare IP blocks."""
     try:
-        url = "https://api.binance.us/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=2"
+        # Bybit's API is fully open to cloud data center traffic
+        url = "https://api.bybit.com/v5/market/kline?category=spot&symbol=BTCUSDT&interval=15&limit=2"
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
         
-        if isinstance(data, list) and len(data) >= 2:
-            prev_candle = data[0]
+        # Bybit returns data in descending order: Index 0 is the current active candle, Index 1 is the last closed candle
+        klines = data.get("result", {}).get("list", [])
+        if len(klines) >= 2:
+            prev_candle = klines[1]
             open_price = float(prev_candle[1])
             close_price = float(prev_candle[4])
             return "UP" if close_price > open_price else "DOWN"
+        else:
+            log_update(f"[API ERROR] Unexpected Bybit format: {data}")
+            return None
+            
     except Exception as e:
-        log_update(f"[SYSTEM ERROR] Binance.US fetch failed: {e}")
-    return None
+        log_update(f"[SYSTEM ERROR] Bybit fetch failed: {e}")
+        return None
 
 def fetch_live_polymarket_id(window_timestamp):
     """Calculates target slug and retrieves market metadata."""
@@ -117,15 +124,16 @@ def bot_loop():
             state["profit_target_hit"] = False
             state["trailing_peak"] = 0.0
             
-            side = check_binance_candle()
+            # Now querying Bybit instead of Binance
+            side = check_previous_candle_trend()
             if not side:
-                log_update("[SYSTEM ALERT] Candle unreadable. Retrying next cycle.")
+                log_update("[SYSTEM ALERT] Candle unreadable via Bybit. Retrying next cycle.")
                 state["current_window_timestamp"] = 0
                 time.sleep(5)
                 continue
                 
             state["side"] = side
-            log_update(f"[STRATEGY] Activating {side} Token ladder.")
+            log_update(f"[STRATEGY] Previous Candle Check: Activating {side} Token ladder.")
             
             market_id = fetch_live_polymarket_id(calculated_window)
             if not market_id:
@@ -135,7 +143,7 @@ def bot_loop():
                 continue
                 
             state["market_id"] = market_id
-            log_update(f"[LIVE TRACKING] Market: {market_id}")
+            log_update(f"[LIVE TRACKING] Market ID Locked: {market_id}")
 
         # 2. HISTORICAL AUTO-RESOLUTION ENGINE
         if old_market_id and old_held_shares > 0:
@@ -217,7 +225,7 @@ def bot_loop():
         time.sleep(3)
 
 # -----------------------------------------------------------------------------
-# Web Server & Dashboard (Single File Structure)
+# Web Server & Dashboard
 # -----------------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -225,7 +233,7 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Bot Dashboard</title>
+    <title>BTC 15M Bot Dashboard</title>
     <meta http-equiv="refresh" content="5">
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0f172a; color: #f8fafc; padding: 20px; }
@@ -250,40 +258,4 @@ DASHBOARD_HTML = """
             <h3>📡 Active Market</h3>
             <p><strong>Target Block:</strong> {{ state.current_window_timestamp }}</p>
             <p><strong>Market ID:</strong> {{ state.market_id }}</p>
-            <p><strong>Direction Trigger:</strong> {{ state.side }}</p>
-        </div>
-        
-        <div class="card">
-            <h3>🪜 Standard Ladder</h3>
-            <p><strong>Active Shares:</strong> {{ state.base_shares }}</p>
-            <p><strong>Avg Entry:</strong> ${{ "%.2f"|format(state.average_entry) }}</p>
-            <p><strong>Last Buy Tier:</strong> ${{ "%.2f"|format(state.last_buy_price) }}</p>
-        </div>
-
-        <div class="card">
-            <h3>🌕 Moonbag & Trailing</h3>
-            <p><strong>Locked Moonbag (0.98):</strong> {{ state.moonbag_shares }} shares</p>
-            <p><strong>Re-entry Peak Tracker:</strong> ${{ "%.2f"|format(state.trailing_peak) }}</p>
-        </div>
-    </div>
-
-    <div class="log-box">
-        > {{ state.latest_log }}
-    </div>
-</body>
-</html>
-"""
-
-@app.route('/')
-def dashboard():
-    """Serves the live HTML dashboard."""
-    return render_template_string(DASHBOARD_HTML, balance=VIRTUAL_BALANCE, state=state)
-
-if __name__ == "__main__":
-    # Spin up the background trading loop as a daemon thread
-    trading_thread = threading.Thread(target=bot_loop, daemon=True)
-    trading_thread.start()
-    
-    # Run the web server on the port assigned by Railway
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+            <p><strong>Direction Trigger:
