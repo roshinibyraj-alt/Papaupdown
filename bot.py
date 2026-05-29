@@ -258,4 +258,40 @@ DASHBOARD_HTML = """
             <h3>📡 Active Market</h3>
             <p><strong>Target Block:</strong> {{ state.current_window_timestamp }}</p>
             <p><strong>Market ID:</strong> {{ state.market_id }}</p>
-            <p><strong>Direction Trigger:
+            <p><strong>Direction Trigger:</strong> {{ state.side }}</p>
+        </div>
+        
+        <div class="card">
+            <h3>🪜 Standard Ladder</h3>
+            <p><strong>Active Shares:</strong> {{ state.base_shares }}</p>
+            <p><strong>Avg Entry:</strong> ${{ "%.2f"|format(state.average_entry) }}</p>
+            <p><strong>Last Buy Tier:</strong> ${{ "%.2f"|format(state.last_buy_price) }}</p>
+        </div>
+
+        <div class="card">
+            <h3>🌕 Moonbag & Trailing</h3>
+            <p><strong>Locked Moonbag (0.98):</strong> {{ state.moonbag_shares }} shares</p>
+            <p><strong>Re-entry Peak Tracker:</strong> ${{ "%.2f"|format(state.trailing_peak) }}</p>
+        </div>
+    </div>
+
+    <div class="log-box">
+        > {{ state.latest_log }}
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/')
+def dashboard():
+    """Serves the live HTML dashboard."""
+    return render_template_string(DASHBOARD_HTML, balance=VIRTUAL_BALANCE, state=state)
+
+if __name__ == "__main__":
+    # Spin up the background trading loop as a daemon thread
+    trading_thread = threading.Thread(target=bot_loop, daemon=True)
+    trading_thread.start()
+    
+    # Run the web server on the port assigned by Railway
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
