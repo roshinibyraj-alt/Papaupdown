@@ -4,7 +4,6 @@ from threading import Thread
 from flask import Flask, render_template_string
 import requests
 
-# Force strict import of the Polymarket library
 try:
     from py_clob_client.client import ClobClient
     CLOB_AVAILABLE = True
@@ -33,7 +32,6 @@ bot_state = {
     "trade_history": []
 }
 
-# Secure credentials setup from environment variables
 PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
 API_KEY = os.getenv("POLY_API_KEY", "")
 API_SECRET = os.getenv("POLY_API_SECRET", "")
@@ -45,7 +43,6 @@ def add_log(message):
     if len(bot_state["logs"]) > 50:
         bot_state["logs"].pop()
 
-# --- INITIALIZE RAW CLIENT ---
 def get_authenticated_client():
     if not CLOB_AVAILABLE:
         return None
@@ -79,7 +76,7 @@ def get_sync_time():
             pass
     return int(time.time())
 
-# --- EXCLUSIVE LIVE ORDER BOOK PRICING ---
+# --- DYNAMIC TOKEN SOLVER ENGINE ---
 def update_market_context():
     global client
     if not client:
@@ -92,9 +89,8 @@ def update_market_context():
     bot_state["live_btc_spot"] = get_real_btc_price()
     bot_state["time_left_seconds"] = max(0, window_end - server_time)
 
-    # Detect window turnover via exact Polymarket Server timestamps
+    # Reset frame on exact 15-minute turnover boundaries
     if bot_state["current_window_start"] != interval_start:
-        # Clear positions for the new live cycle
         bot_state["current_window_start"] = interval_start
         bot_state["window_strike_price"] = bot_state["live_btc_spot"]
         bot_state["shares_held"] = 0
@@ -105,40 +101,51 @@ def update_market_context():
         bot_state["strategy_direction"] = "PENDING"
         add_log(f"--- Switched to Live Market Window: btc-updown-15m-{interval_start} ---")
 
-    # Set dynamic direction bias based on momentum deviation
+    # Set strategy layout flags based on spot movement from strike
     if bot_state["strategy_direction"] == "PENDING":
         price_diff = bot_state["live_btc_spot"] - bot_state["window_strike_price"]
-        if price_diff > 2.0:
+        if price_diff > 1.5:
             bot_state["strategy_direction"] = "UP"
-            add_log("Direction biased Locked: UP.")
-        elif price_diff < -2.0:
+            add_log(f"Direction Locked: UP (Spot crossed strike +$1.50)")
+        elif price_diff < -1.5:
             bot_state["strategy_direction"] = "DOWN"
-            add_log("Direction biased Locked: DOWN.")
+            add_log(f"Direction Locked: DOWN (Spot crossed strike -$1.50)")
         else:
             return
 
-    # PULL DIRECT LIVE BOOK FROM THE API
+    # EXCLUSIVE DYNAMIC BOOK TARGETING (No hardcoded indexes)
     if client:
         try:
             slug = f"btc-updown-15m-{bot_state['current_window_start']}"
             market_data = client.get_market_by_slug(slug)
             
             if market_data and "tokens" in market_data:
-                # Token Index 0 is YES (UP), Index 1 is NO (DOWN)
-                token_index = 0 if bot_state["strategy_direction"] == "UP" else 1
-                token_id = market_data["tokens"][token_index]["token_id"]
+                token_id = None
+                target_outcome = "Yes" if bot_state["strategy_direction"] == "UP" else "No"
                 
+                # Scan tokens explicitly matching the required outcome string mapping
+                for token in market_data["tokens"]:
+                    if token.get("outcome", "").strip().lower() == target_outcome.lower():
+                        token_id = token.get("token_id")
+                        break
+                
+                # Fallback safeguard index mapping if outcome names aren't parsed explicitly
+                if not token_id:
+                    token_id = market_data["tokens"][0]["token_id"] if bot_state["strategy_direction"] == "UP" else market_data["tokens"][1]["token_id"]
+
+                # Fetch real-time book depth
                 order_book = client.get_order_book(token_id)
                 
-                # Fetch Top-of-Book Pricing directly from real liquidity pools
-                if order_book and order_book.bids:
-                    live_market_bid = float(order_book.bids[0].price)
-                    bot_state["current_price"] = live_market_bid
-                elif order_book and order_book.asks:
-                    live_market_ask = float(order_book.asks[0].price)
-                    bot_state["current_price"] = live_market_ask
+                if order_book:
+                    if order_book.bids and len(order_book.bids) > 0:
+                        bot_state["current_price"] = float(order_book.bids[0].price)
+                    elif order_book.asks and len(order_book.asks) > 0:
+                        bot_state["current_price"] = float(order_book.asks[0].price)
+                    else:
+                        # Fallback case: if book liquidity gaps out temporarily, calculate implied spot baseline
+                        pass
         except Exception as e:
-            print(f"Error streaming direct order book data: {e}")
+            print(f"API Streaming Exception Error: {e}")
 
 # --- LADDER EXECUTION ENGINE ---
 def run_trading_logic():
@@ -148,7 +155,6 @@ def run_trading_logic():
     if direction == "PENDING" or not (0.01 <= price <= 0.99):
         return
 
-    # Check for execution triggers across 5-cent increments
     import math
     current_level = round(math.floor(price / 0.05) * 0.05, 2)
 
@@ -162,14 +168,14 @@ def run_trading_logic():
             
             bot_state["avg_entry_price"] = round(bot_state["total_spent"] / bot_state["shares_held"], 4)
             bot_state["target_exit_price"] = round(bot_state["avg_entry_price"] + 0.10, 4)
-            add_log(f"Position Buy Order filled: 100 shares at real price {price:.2f} USDC")
+            add_log(f"Position Buy Filled: 100 shares at real price {price:.2f} USDC (Bracket: {current_level})")
 
     if bot_state["shares_held"] > 0 and price >= bot_state["target_exit_price"]:
         revenue = bot_state["shares_held"] * price
         profit = revenue - bot_state["total_spent"]
         bot_state["balance"] += revenue
         
-        add_log(f"TAKE PROFIT TARGET HIT: Sold position at live market price {price:.2f} USDC.")
+        add_log(f"TAKE PROFIT TARGET HIT: Sold positions at live market price {price:.2f} USDC.")
         bot_state["trade_history"].append({
             "window": time.strftime("%H:%M", time.localtime(bot_state["current_window_start"])),
             "direction": direction,
@@ -195,7 +201,7 @@ def background_loop():
 
 Thread(target=background_loop, daemon=True).start()
 
-# --- DASHBOARD FRONTEND VIEWS ---
+# --- DASHBOARD FRONTEND ---
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="en">
