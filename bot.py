@@ -1,853 +1,614 @@
-#!/usr/bin/env python3
 """
-=============================================================
-  Polymarket BTC 15m Demo Trading Bot
-  $2,000 virtual capital | Web Dashboard
-  Deploy on Railway — zero config needed
-=============================================================
+Polymarket Demo Bot — "Liquidity Fade" Strategy
+Market: BTC 5-min UP/DOWN binary markets
+Logic: Buy the underpriced side (<0.35), sell at TP=0.55 or SL=0.15
+Demo mode: $2000 virtual balance, NO real money
 """
 
-import os, json, time, math, random, threading, logging
-from datetime import datetime, timezone, timedelta
-from collections import deque
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.request, urllib.error
+import time, json, threading, logging, os, requests
+from datetime import datetime, timezone
+from flask import Flask, jsonify, render_template_string
 
-# ─────────────── CONFIG ───────────────
-DEMO_CAPITAL      = 2000.0   # Starting virtual balance ($)
-BET_FRACTION      = 0.04     # Risk 4% of balance per trade
-MIN_EDGE          = 0.04     # Need ≥4% edge over market price to enter
-MIN_PROB          = 0.52     # Only bet when our model says ≥52% confidence
-MAX_OPEN_TRADES   = 2        # Hold at most 2 positions simultaneously
-POLL_INTERVAL     = 45       # Seconds between market checks
-PORT              = int(os.environ.get("PORT", 8080))
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+DEMO_BALANCE_START = 2000.0
+TRANCHE_SIZES      = [20, 30, 50]   # shares per tranche (3 tranches max)
+BUY_THRESHOLD      = 0.35           # buy when price <= this
+TAKE_PROFIT        = 0.55           # sell when price >= this
+STOP_LOSS          = 0.15           # sell when price <= this
+SKIP_LAST_SECS     = 60            # don't open new trades in last 60s of window
+TAKER_FEE          = 0.02           # 2% per trade
+POLL_INTERVAL      = 8             # seconds between price checks
+WINDOW_SECONDS     = 300           # 5-min windows
+
+GAMMA_BASE = "https://gamma-api.polymarket.com"
+CLOB_BASE  = "https://clob.polymarket.com"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("btc-bot")
+log = logging.getLogger("bot")
 
-# ─────────────── MARKET DISCOVERY ───────────────
-
-def get_current_15m_timestamp():
-    """Return the Unix timestamp for the current 15-minute window (floor)."""
-    now = int(time.time())
-    return (now // 900) * 900
-
-def build_slug(ts):
-    return f"btc-updown-15m-{ts}"
-
-def fetch_gamma_market(slug):
-    """Query Polymarket Gamma API for a market by slug."""
-    url = f"https://gamma-api.polymarket.com/markets?slug={slug}"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "btc-demo-bot/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            data = json.loads(r.read())
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]
-    except Exception as e:
-        log.warning(f"Gamma API error for {slug}: {e}")
-    return None
-
-def fetch_clob_prices(condition_id):
-    """Fetch best buy prices from the CLOB order book."""
-    url = f"https://clob.polymarket.com/book?token_id={condition_id}"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "btc-demo-bot/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            ob = json.loads(r.read())
-            bids = ob.get("bids", [])
-            best_bid = float(bids[0]["price"]) if bids else None
-            return best_bid
-    except Exception as e:
-        log.debug(f"CLOB error: {e}")
-    return None
-
-def fetch_btc_price():
-    """Fetch current BTC/USD price from Binance public API."""
-    try:
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        req = urllib.request.Request(url, headers={"User-Agent": "btc-demo-bot/1.0"})
-        with urllib.request.urlopen(req, timeout=6) as r:
-            return float(json.loads(r.read())["price"])
-    except Exception as e:
-        log.debug(f"Binance error: {e}")
-    return None
-
-def fetch_btc_klines(interval="1m", limit=30):
-    """Fetch recent klines (OHLCV) from Binance."""
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval={interval}&limit={limit}"
-        req = urllib.request.Request(url, headers={"User-Agent": "btc-demo-bot/1.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            raw = json.loads(r.read())
-            # [open_time, open, high, low, close, volume, ...]
-            return [(float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])) for k in raw]
-    except Exception as e:
-        log.debug(f"Klines error: {e}")
-    return []
-
-def find_active_market():
-    """Try current and previous 15m window slots to find an open market."""
-    for offset in [0, -1, 1, -2]:
-        ts = get_current_15m_timestamp() + (offset * 900)
-        slug = build_slug(ts)
-        market = fetch_gamma_market(slug)
-        if market and market.get("active", False) and not market.get("closed", True):
-            log.info(f"Found active market: {slug}")
-            return market, slug, ts
-    return None, None, None
-
-# ─────────────── SIGNAL ENGINE ───────────────
-
-def compute_rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def compute_ema(values, period):
-    if not values:
-        return 0.0
-    k = 2 / (period + 1)
-    ema = values[0]
-    for v in values[1:]:
-        ema = v * k + ema * (1 - k)
-    return ema
-
-def compute_macd(closes):
-    if len(closes) < 26:
-        return 0.0, 0.0
-    ema12 = compute_ema(closes[-26:], 12)
-    ema26 = compute_ema(closes[-26:], 26)
-    macd_line = ema12 - ema26
-    # Signal = 9-period EMA of MACD (approximate)
-    signal = compute_ema([macd_line] * 9, 9)
-    return macd_line, signal
-
-def compute_vwap(klines):
-    if not klines:
-        return 0.0
-    numerator = sum(((h + l + c) / 3) * v for _, h, l, c, v in klines)
-    denominator = sum(v for _, _, _, _, v in klines)
-    return numerator / denominator if denominator else 0.0
-
-def generate_signal(klines_1m, klines_5m, btc_price):
-    """
-    Multi-factor signal engine.
-    Returns: direction ('UP'|'DOWN'|None), probability (0-1), reasons (list)
-    """
-    if len(klines_1m) < 20 or btc_price is None:
-        return None, 0.5, ["Insufficient data"]
-
-    closes_1m = [k[3] for k in klines_1m]
-    closes_5m = [k[3] for k in klines_5m] if klines_5m else closes_1m
-
-    rsi = compute_rsi(closes_1m)
-    macd, macd_sig = compute_macd(closes_1m)
-    vwap = compute_vwap(klines_1m[-15:])
-
-    # Momentum: last 3 closes direction
-    short_mom = closes_1m[-1] - closes_1m[-4] if len(closes_1m) >= 4 else 0
-    # Medium momentum: last 10 closes
-    med_mom = closes_1m[-1] - closes_1m[-11] if len(closes_1m) >= 11 else 0
-
-    scores = []
-    reasons = []
-
-    # RSI
-    if rsi < 35:
-        scores.append(+0.20)
-        reasons.append(f"RSI oversold ({rsi:.1f})")
-    elif rsi > 65:
-        scores.append(-0.20)
-        reasons.append(f"RSI overbought ({rsi:.1f})")
-    elif 45 <= rsi <= 55:
-        scores.append(0)
-        reasons.append(f"RSI neutral ({rsi:.1f})")
-    elif rsi < 50:
-        scores.append(+0.08)
-    else:
-        scores.append(-0.08)
-
-    # MACD crossover
-    if macd > macd_sig and macd > 0:
-        scores.append(+0.18)
-        reasons.append("MACD bullish crossover")
-    elif macd < macd_sig and macd < 0:
-        scores.append(-0.18)
-        reasons.append("MACD bearish crossover")
-    else:
-        scores.append(+0.05 if macd > macd_sig else -0.05)
-
-    # Price vs VWAP
-    if vwap > 0:
-        pct_from_vwap = (btc_price - vwap) / vwap * 100
-        if pct_from_vwap > 0.05:
-            scores.append(-0.10)
-            reasons.append(f"Price above VWAP (+{pct_from_vwap:.2f}%)")
-        elif pct_from_vwap < -0.05:
-            scores.append(+0.10)
-            reasons.append(f"Price below VWAP ({pct_from_vwap:.2f}%)")
-        else:
-            scores.append(0)
-
-    # Short momentum
-    if short_mom > 0:
-        scores.append(+0.12)
-        reasons.append("Positive 3m momentum")
-    elif short_mom < 0:
-        scores.append(-0.12)
-        reasons.append("Negative 3m momentum")
-
-    # Medium momentum
-    if med_mom > 0:
-        scores.append(+0.08)
-    elif med_mom < 0:
-        scores.append(-0.08)
-
-    total = sum(scores)
-    # Convert score to probability (sigmoid-like)
-    prob_up = 0.5 + total * 0.5
-    prob_up = max(0.30, min(0.70, prob_up))
-
-    if prob_up >= MIN_PROB:
-        return "UP", prob_up, reasons
-    elif (1 - prob_up) >= MIN_PROB:
-        return "DOWN", 1 - prob_up, reasons
-    return None, prob_up, reasons + ["No clear edge"]
-
-# ─────────────── STATE ───────────────
-
+# ─── STATE ─────────────────────────────────────────────────────────────────────
 state = {
-    "balance": DEMO_CAPITAL,
-    "initial": DEMO_CAPITAL,
-    "trades": [],            # completed trades
-    "open_positions": [],    # active bets
-    "btc_price": None,
-    "last_market_slug": None,
-    "last_market_end_ts": None,
-    "status": "Starting…",
-    "signal": None,
-    "signal_prob": 0.5,
-    "signal_reasons": [],
-    "rsi": 50.0,
-    "last_update": None,
-    "errors": deque(maxlen=10),
-    "btc_history": deque(maxlen=60),  # last 60 price ticks
-    "total_bets": 0,
-    "wins": 0,
-    "losses": 0,
-    "market_found": False,
+    "balance":       DEMO_BALANCE_START,
+    "start_balance": DEMO_BALANCE_START,
+    "positions":     [],   # active open trades
+    "history":       [],   # closed trades
+    "log":           [],   # live event log (last 60)
+    "prices":        {"UP": None, "DOWN": None},
+    "window_ts":     None,
+    "window_end":    None,
+    "status":        "Starting…",
+    "trades_today":  0,
+    "wins":          0,
+    "losses":        0,
+    "started_at":    datetime.now(timezone.utc).isoformat(),
 }
-state_lock = threading.Lock()
+lock = threading.Lock()
 
-# ─────────────── BOT LOOP ───────────────
+def add_log(msg, level="info"):
+    entry = {"t": datetime.now(timezone.utc).strftime("%H:%M:%S"), "msg": msg, "level": level}
+    with lock:
+        state["log"].insert(0, entry)
+        state["log"] = state["log"][:80]
+    log.info(msg)
 
-def resolve_open_positions():
-    """Check if any open positions should be resolved (market ended)."""
-    now_ts = int(time.time())
-    with state_lock:
-        still_open = []
-        for pos in state["open_positions"]:
-            end_ts = pos["end_ts"]
-            if now_ts >= end_ts + 30:  # 30s grace after window ends
-                # Fetch resolution from Gamma API
-                market = fetch_gamma_market(pos["slug"])
-                resolved = False
-                if market:
-                    resolution = market.get("resolution", "")
-                    if resolution in ("UP", "DOWN"):
-                        won = (resolution == pos["direction"])
-                        pnl = pos["stake"] * (1 / pos["entry_price"] - 1) if won else -pos["stake"]
-                        state["balance"] += pos["stake"] + (pnl if won else 0)
-                        trade = {**pos, "pnl": round(pnl, 2), "won": won,
-                                 "resolution": resolution,
-                                 "closed_at": datetime.now(timezone.utc).isoformat()}
-                        state["trades"].insert(0, trade)
-                        if len(state["trades"]) > 50:
-                            state["trades"] = state["trades"][:50]
-                        state["total_bets"] += 1
-                        if won:
-                            state["wins"] += 1
-                        else:
-                            state["losses"] += 1
-                        log.info(f"Trade resolved: {pos['direction']} {resolution} | PnL ${pnl:.2f}")
-                        resolved = True
-                    elif resolution in ("", None) and not market.get("active"):
-                        # Market closed but no resolution yet — simulate with Binance price
-                        # We use the BTC price change as a proxy
-                        if state["btc_price"] and pos.get("btc_at_entry"):
-                            price_diff = state["btc_price"] - pos["btc_at_entry"]
-                            resolution = "UP" if price_diff >= 0 else "DOWN"
-                            won = (resolution == pos["direction"])
-                            pnl = pos["stake"] * (1 / pos["entry_price"] - 1) if won else -pos["stake"]
-                            state["balance"] += pos["stake"] + (pnl if won else 0)
-                            trade = {**pos, "pnl": round(pnl, 2), "won": won,
-                                     "resolution": resolution + "*",
-                                     "closed_at": datetime.now(timezone.utc).isoformat()}
-                            state["trades"].insert(0, trade)
-                            if len(state["trades"]) > 50:
-                                state["trades"] = state["trades"][:50]
-                            state["total_bets"] += 1
-                            if won: state["wins"] += 1
-                            else: state["losses"] += 1
-                            resolved = True
-                if not resolved:
-                    still_open.append(pos)
-            else:
-                still_open.append(pos)
-        state["open_positions"] = still_open
+# ─── MARKET DISCOVERY ──────────────────────────────────────────────────────────
+def get_current_window_ts():
+    return (int(time.time()) // WINDOW_SECONDS) * WINDOW_SECONDS
 
+def fetch_market():
+    """Try /events slug first, fall back to /markets search."""
+    wts = get_current_window_ts()
+    slug = f"btc-updown-5m-{wts}"
+    try:
+        r = requests.get(f"{GAMMA_BASE}/events?slug={slug}", timeout=10)
+        if r.ok:
+            data = r.json()
+            if data:
+                ev = data[0]
+                mkts = ev.get("markets", [])
+                if mkts:
+                    return parse_market(mkts[0]), wts
+    except Exception as e:
+        log.warning(f"Event slug fetch failed: {e}")
+
+    # Fallback: search active markets
+    try:
+        r = requests.get(
+            f"{GAMMA_BASE}/markets",
+            params={"active": "true", "tag": "crypto", "limit": 50},
+            timeout=10
+        )
+        if r.ok:
+            for m in r.json():
+                q = m.get("question", "").lower()
+                if "btc" in q and "5" in q and ("up" in q or "down" in q):
+                    return parse_market(m), wts
+    except Exception as e:
+        log.warning(f"Fallback market fetch failed: {e}")
+
+    return None, wts
+
+def parse_market(m):
+    try:
+        token_ids    = json.loads(m.get("clobTokenIds", "[]"))
+        outcomes     = json.loads(m.get("outcomes",     "[]"))
+        outcome_prices = json.loads(m.get("outcomePrices", "[0.5,0.5]"))
+    except Exception:
+        token_ids      = m.get("clobTokenIds", [])
+        outcomes       = m.get("outcomes",     [])
+        outcome_prices = m.get("outcomePrices", [0.5, 0.5])
+
+    # Dynamically map UP/DOWN by outcome label
+    up_idx, down_idx = 0, 1
+    for i, o in enumerate(outcomes):
+        if isinstance(o, str) and "up" in o.lower():
+            up_idx = i
+        if isinstance(o, str) and "down" in o.lower():
+            down_idx = i
+
+    return {
+        "condition_id": m.get("conditionId", m.get("id", "")),
+        "question":     m.get("question", "BTC 5m"),
+        "token_up":     token_ids[up_idx]   if len(token_ids) > up_idx   else None,
+        "token_down":   token_ids[down_idx] if len(token_ids) > down_idx else None,
+        "price_up":     float(outcome_prices[up_idx])   if len(outcome_prices) > up_idx   else 0.5,
+        "price_down":   float(outcome_prices[down_idx]) if len(outcome_prices) > down_idx else 0.5,
+    }
+
+# ─── LIVE PRICE FETCH ──────────────────────────────────────────────────────────
+def fetch_prices(market):
+    prices = {"UP": market["price_up"], "DOWN": market["price_down"]}
+    try:
+        for side, token in [("UP", market["token_up"]), ("DOWN", market["token_down"])]:
+            if not token:
+                continue
+            r = requests.get(f"{CLOB_BASE}/midpoint?token_id={token}", timeout=6)
+            if r.ok:
+                mid = r.json().get("mid")
+                if mid is not None:
+                    prices[side] = float(mid)
+    except Exception as e:
+        log.debug(f"Price fetch error: {e}")
+    return prices
+
+# ─── TRADE LOGIC ───────────────────────────────────────────────────────────────
+def can_open_trade(side, price, secs_left):
+    if secs_left < SKIP_LAST_SECS:
+        return False, "Too close to window close"
+    # Check we don't already have max tranches open on this side
+    with lock:
+        open_for_side = [p for p in state["positions"] if p["side"] == side and p["window_ts"] == state["window_ts"]]
+    if len(open_for_side) >= len(TRANCHE_SIZES):
+        return False, f"Max tranches reached for {side}"
+    if price > BUY_THRESHOLD:
+        return False, f"{side} price {price:.3f} above threshold {BUY_THRESHOLD}"
+    with lock:
+        bal = state["balance"]
+    tranche_idx = len(open_for_side)
+    shares = TRANCHE_SIZES[tranche_idx]
+    cost = shares * price * (1 + TAKER_FEE)
+    if bal < cost:
+        return False, f"Insufficient balance (need ${cost:.2f}, have ${bal:.2f})"
+    return True, shares
+
+def open_trade(side, price, shares, market):
+    cost = shares * price * (1 + TAKER_FEE)
+    trade = {
+        "id":         len(state["history"]) + len(state["positions"]) + 1,
+        "side":       side,
+        "shares":     shares,
+        "entry":      price,
+        "cost":       cost,
+        "tp":         TAKE_PROFIT,
+        "sl":         STOP_LOSS,
+        "opened_at":  datetime.now(timezone.utc).isoformat(),
+        "window_ts":  state["window_ts"],
+        "question":   market["question"],
+        "status":     "OPEN",
+        "pnl":        0.0,
+    }
+    with lock:
+        state["balance"] -= cost
+        state["positions"].append(trade)
+        state["trades_today"] += 1
+    add_log(f"🟢 BUY {shares}x {side} @ {price:.3f} | cost ${cost:.2f} | bal ${state['balance']:.2f}", "buy")
+    return trade
+
+def close_trade(trade, current_price, reason):
+    proceeds = trade["shares"] * current_price * (1 - TAKER_FEE)
+    pnl = proceeds - trade["cost"]
+    trade["exit"]       = current_price
+    trade["proceeds"]   = proceeds
+    trade["pnl"]        = pnl
+    trade["closed_at"]  = datetime.now(timezone.utc).isoformat()
+    trade["close_reason"] = reason
+    trade["status"]     = "WIN" if pnl > 0 else "LOSS"
+    with lock:
+        state["balance"] += proceeds
+        state["positions"].remove(trade)
+        state["history"].insert(0, trade)
+        state["history"] = state["history"][:200]
+        if pnl > 0:
+            state["wins"] += 1
+        else:
+            state["losses"] += 1
+    emoji = "✅" if pnl > 0 else "❌"
+    add_log(f"{emoji} CLOSE {trade['shares']}x {trade['side']} @ {current_price:.3f} | PnL ${pnl:+.2f} | {reason}", "win" if pnl > 0 else "loss")
+
+def check_exits(prices):
+    with lock:
+        positions_copy = list(state["positions"])
+    for trade in positions_copy:
+        price = prices.get(trade["side"])
+        if price is None:
+            continue
+        if price >= TAKE_PROFIT:
+            close_trade(trade, price, "TP hit")
+        elif price <= STOP_LOSS:
+            close_trade(trade, price, "SL hit")
+
+def force_close_all(prices, reason="Window end"):
+    with lock:
+        positions_copy = list(state["positions"])
+    for trade in positions_copy:
+        price = prices.get(trade["side"], trade["entry"])
+        # If window settled, check settled prices (0 or 1)
+        if reason == "Window end":
+            # In real Polymarket, settled side goes to 1.0
+            # We simulate: if price > 0.5 it likely resolved YES
+            price = min(max(price, 0.0), 1.0)
+        close_trade(trade, price, reason)
+
+# ─── MAIN BOT LOOP ─────────────────────────────────────────────────────────────
 def bot_loop():
-    log.info("Bot loop started.")
+    add_log("🚀 Bot started — Liquidity Fade strategy, $2000 demo", "info")
+    current_market = None
+
     while True:
         try:
-            # 1. Fetch BTC price
-            btc_price = fetch_btc_price()
-            klines_1m = fetch_btc_klines("1m", 30)
-            klines_5m = fetch_btc_klines("5m", 20)
+            now_ts     = int(time.time())
+            window_ts  = get_current_window_ts()
+            secs_left  = WINDOW_SECONDS - (now_ts - window_ts)
+            window_end = window_ts + WINDOW_SECONDS
 
-            with state_lock:
-                if btc_price:
-                    state["btc_price"] = btc_price
-                    state["btc_history"].append({"t": int(time.time()), "p": btc_price})
-                closes_1m = [k[3] for k in klines_1m]
-                state["rsi"] = compute_rsi(closes_1m) if closes_1m else 50.0
-                state["last_update"] = datetime.now(timezone.utc).isoformat()
+            with lock:
+                state["window_ts"]  = window_ts
+                state["window_end"] = window_end
 
-            # 2. Resolve completed positions
-            resolve_open_positions()
-
-            # 3. Find active market
-            market, slug, ts = find_active_market()
-            with state_lock:
-                if market:
-                    state["market_found"] = True
-                    state["last_market_slug"] = slug
-                    state["last_market_end_ts"] = ts + 900
-                    state["status"] = f"Market found: {slug}"
+            # Refresh market each new window
+            if current_market is None or current_market.get("_window_ts") != window_ts:
+                add_log(f"🔍 New window {datetime.fromtimestamp(window_ts, tz=timezone.utc).strftime('%H:%M')} — fetching market…")
+                m, wts = fetch_market()
+                if m:
+                    m["_window_ts"] = wts
+                    current_market = m
+                    add_log(f"📋 Market: {m['question']}")
+                    with lock:
+                        state["status"] = f"Active: {m['question']}"
                 else:
-                    state["market_found"] = False
-                    state["status"] = "Waiting for next 15m window…"
+                    add_log("⚠️  No active 5m BTC market found, retrying…", "warn")
+                    with lock:
+                        state["status"] = "Searching for market…"
+                    time.sleep(15)
+                    continue
 
-            # 4. Generate signal
-            direction, prob, reasons = generate_signal(klines_1m, klines_5m, btc_price)
-            with state_lock:
-                state["signal"] = direction
-                state["signal_prob"] = round(prob, 3)
-                state["signal_reasons"] = reasons
+            # Force close if window just ended
+            if secs_left <= 2 and state["positions"]:
+                prices = fetch_prices(current_market)
+                add_log(f"⏰ Window closing — force-closing {len(state['positions'])} position(s)")
+                force_close_all(prices, "Window end")
+                current_market = None
+                time.sleep(5)
+                continue
 
-            # 5. Decide whether to place a trade
-            if market and direction and btc_price:
-                with state_lock:
-                    open_count = len(state["open_positions"])
-                    balance = state["balance"]
-                    already_in_this_market = any(p["slug"] == slug for p in state["open_positions"])
+            # Fetch live prices
+            prices = fetch_prices(current_market)
+            with lock:
+                state["prices"] = prices
 
-                if open_count < MAX_OPEN_TRADES and not already_in_this_market:
-                    # Fetch market token IDs
-                    tokens_raw = market.get("tokens") or market.get("clobTokenIds") or "[]"
-                    if isinstance(tokens_raw, str):
-                        try:
-                            tokens = json.loads(tokens_raw)
-                        except:
-                            tokens = []
-                    else:
-                        tokens = tokens_raw if isinstance(tokens_raw, list) else []
+            add_log(f"💹 UP={prices['UP']:.3f}  DOWN={prices['DOWN']:.3f}  ⏱ {secs_left}s left", "price")
 
-                    # Determine UP/DOWN token (UP is usually first)
-                    token_idx = 0 if direction == "UP" else 1
-                    token_id = tokens[token_idx] if len(tokens) > token_idx else None
+            # Check exits first
+            check_exits(prices)
 
-                    # Get market price
-                    market_price = None
-                    if token_id:
-                        market_price = fetch_clob_prices(str(token_id))
-
-                    # Fallback: use outcome prices from market metadata
-                    if market_price is None:
-                        outcomes_prices = market.get("outcomePrices") or "[]"
-                        if isinstance(outcomes_prices, str):
-                            try:
-                                op = json.loads(outcomes_prices)
-                                market_price = float(op[token_idx]) if len(op) > token_idx else 0.5
-                            except:
-                                market_price = 0.5
-                        elif isinstance(outcomes_prices, list) and len(outcomes_prices) > token_idx:
-                            market_price = float(outcomes_prices[token_idx])
-                        else:
-                            market_price = 0.5
-
-                    # Edge check: our prob vs market implied prob
-                    edge = prob - market_price
-                    if edge >= MIN_EDGE and market_price < 0.95:
-                        stake = round(balance * BET_FRACTION, 2)
-                        if stake >= 1.0:
-                            end_ts = ts + 900
-                            pos = {
-                                "slug": slug,
-                                "direction": direction,
-                                "stake": stake,
-                                "entry_price": market_price,
-                                "prob": round(prob, 3),
-                                "edge": round(edge, 3),
-                                "end_ts": end_ts,
-                                "btc_at_entry": btc_price,
-                                "reasons": reasons,
-                                "opened_at": datetime.now(timezone.utc).isoformat(),
-                                "window_end": datetime.fromtimestamp(end_ts, tz=timezone.utc).strftime("%H:%M UTC"),
-                            }
-                            with state_lock:
-                                state["balance"] -= stake
-                                state["open_positions"].append(pos)
-                            log.info(f"Placed {direction} bet | Stake ${stake:.2f} | Price {market_price:.3f} | Edge {edge:.3f} | Prob {prob:.3f}")
-                        else:
-                            log.info("Stake too small, skipping")
-                    else:
-                        log.info(f"No edge ({edge:.3f} < {MIN_EDGE}) or price too high ({market_price:.2f}), skipping")
+            # Check for new entry opportunities
+            for side in ["UP", "DOWN"]:
+                price = prices.get(side)
+                if price is None:
+                    continue
+                ok, result = can_open_trade(side, price, secs_left)
+                if ok:
+                    open_trade(side, price, result, current_market)
 
         except Exception as e:
-            log.error(f"Bot loop error: {e}")
-            with state_lock:
-                state["errors"].appendleft(f"{datetime.now().strftime('%H:%M:%S')} {e}")
+            add_log(f"💥 Error: {e}", "error")
+            log.exception("Bot loop error")
 
         time.sleep(POLL_INTERVAL)
 
-# ─────────────── WEB DASHBOARD ───────────────
+# ─── FLASK DASHBOARD ───────────────────────────────────────────────────────────
+app = Flask(__name__)
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BTC-15m Demo Bot</title>
-<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="8">
+<title>Polymarket Demo Bot</title>
 <style>
-:root{
-  --bg:#0a0c10;--surface:#111318;--border:#1e2230;
-  --green:#00e5a0;--red:#ff4560;--blue:#3d9eff;--amber:#ffb800;--muted:#6b7280;
-  --text:#e8eaf0;--subtext:#9ca3af;
-}
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:var(--bg);color:var(--text);font-family:'Space Mono',monospace;font-size:13px;line-height:1.5;min-height:100vh}
-a{color:var(--blue);text-decoration:none}
+  @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600;800&display=swap');
 
-/* grid */
-.wrap{max-width:1200px;margin:0 auto;padding:16px}
-header{display:flex;align-items:center;justify-content:space-between;padding:12px 0 20px;border-bottom:1px solid var(--border);margin-bottom:20px}
-.logo{font-family:'Syne',sans-serif;font-weight:800;font-size:20px;letter-spacing:-.5px}
-.logo span{color:var(--green)}
-.badge{background:#1a2a1a;color:var(--green);padding:3px 10px;border-radius:20px;font-size:11px;border:1px solid #2a3a2a}
+  :root {
+    --bg:      #040a0f;
+    --panel:   #081420;
+    --border:  #0d2a40;
+    --accent:  #00e5ff;
+    --green:   #00ff88;
+    --red:     #ff3355;
+    --yellow:  #ffcc00;
+    --muted:   #3a5a6e;
+    --text:    #c8e6f0;
+  }
 
-.grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
-.grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px}
+  * { box-sizing: border-box; margin: 0; padding: 0; }
 
-/* cards */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:16px}
-.card-head{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin-bottom:8px}
-.card-val{font-family:'Syne',sans-serif;font-size:26px;font-weight:800}
-.card-sub{font-size:11px;color:var(--subtext);margin-top:4px}
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Exo 2', sans-serif;
+    min-height: 100vh;
+    background-image:
+      radial-gradient(ellipse at 20% 0%, #001a2e 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 100%, #001428 0%, transparent 60%);
+  }
 
-.green{color:var(--green)} .red{color:var(--red)} .blue{color:var(--blue)} .amber{color:var(--amber)} .muted{color:var(--muted)}
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 32px;
+    border-bottom: 1px solid var(--border);
+    background: rgba(0,229,255,0.03);
+  }
+  header h1 {
+    font-size: 1.3rem; font-weight: 800; letter-spacing: 2px;
+    color: var(--accent); text-transform: uppercase;
+  }
+  .badge {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 0.75rem; padding: 4px 12px;
+    border: 1px solid var(--green); color: var(--green);
+    border-radius: 20px; animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
 
-/* signal box */
-.signal-box{border-radius:10px;padding:20px;border:2px solid;text-align:center}
-.signal-box.up{border-color:var(--green);background:#0d1f16}
-.signal-box.down{border-color:var(--red);background:#1f0d0d}
-.signal-box.wait{border-color:var(--border);background:var(--surface)}
-.signal-dir{font-family:'Syne',sans-serif;font-size:32px;font-weight:800;letter-spacing:2px}
-.signal-prob{font-size:13px;margin-top:4px}
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 16px; padding: 24px 32px 0;
+  }
+  .stat {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    position: relative; overflow: hidden;
+  }
+  .stat::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  }
+  .stat-label { font-size: 0.68rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; }
+  .stat-value { font-size: 1.7rem; font-weight: 800; margin-top: 6px; line-height: 1; }
+  .stat-value.green { color: var(--green); }
+  .stat-value.red   { color: var(--red); }
+  .stat-value.gold  { color: var(--yellow); }
+  .stat-value.cyan  { color: var(--accent); }
 
-/* trade table */
-table{width:100%;border-collapse:collapse;font-size:12px}
-th{text-align:left;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.5px;padding:6px 8px;border-bottom:1px solid var(--border)}
-td{padding:6px 8px;border-bottom:1px solid #161a22}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#141820}
+  .main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 32px; }
+  @media(max-width:900px){ .main { grid-template-columns: 1fr; } }
 
-/* progress bar */
-.bar-track{background:#1a1e28;border-radius:4px;height:6px;margin-top:6px}
-.bar-fill{height:6px;border-radius:4px;transition:width .5s ease}
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden;
+  }
+  .panel-head {
+    padding: 12px 18px;
+    font-size: 0.72rem; letter-spacing: 2px; text-transform: uppercase;
+    color: var(--accent); border-bottom: 1px solid var(--border);
+    font-weight: 600;
+  }
 
-/* reasons list */
-.reasons{font-size:11px;color:var(--subtext);list-style:none}
-.reasons li::before{content:"› ";color:var(--green)}
+  table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+  th { padding: 8px 14px; text-align: left; color: var(--muted); font-size: 0.65rem; letter-spacing: 1px; text-transform: uppercase; }
+  td { padding: 9px 14px; border-top: 1px solid #0a1e2e; font-family: 'Share Tech Mono', monospace; }
+  tr:hover td { background: rgba(0,229,255,0.04); }
 
-/* sparkline canvas */
-canvas{display:block;width:100%;height:60px}
+  .pill {
+    display: inline-block; padding: 2px 10px; border-radius: 20px;
+    font-size: 0.68rem; font-weight: 600; letter-spacing: 0.5px;
+  }
+  .pill-up   { background: rgba(0,255,136,0.12); color: var(--green); border: 1px solid rgba(0,255,136,0.3); }
+  .pill-down { background: rgba(255,51,85,0.12);  color: var(--red);   border: 1px solid rgba(255,51,85,0.3); }
+  .pill-win  { background: rgba(0,255,136,0.12); color: var(--green); }
+  .pill-loss { background: rgba(255,51,85,0.12);  color: var(--red); }
+  .pill-open { background: rgba(0,229,255,0.12); color: var(--accent); }
 
-/* status dot */
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.dot.green{background:var(--green);box-shadow:0 0 6px var(--green)}
-.dot.red{background:var(--red)}
-.dot.amber{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .log-box { height: 300px; overflow-y: auto; padding: 10px 4px; }
+  .log-entry { display: flex; gap: 10px; padding: 5px 14px; font-size: 0.75rem; font-family: 'Share Tech Mono', monospace; border-bottom: 1px solid #081420; }
+  .log-t { color: var(--muted); min-width: 52px; }
+  .log-buy   { color: var(--green); }
+  .log-win   { color: var(--green); }
+  .log-loss  { color: var(--red); }
+  .log-error { color: var(--red); }
+  .log-warn  { color: var(--yellow); }
+  .log-price { color: #4e7a8e; }
+  .log-info  { color: var(--text); }
 
-/* open position chip */
-.pos-chip{background:#0d1a2a;border:1px solid #1e3450;border-radius:8px;padding:12px;margin-bottom:8px}
-.pos-chip:last-child{margin-bottom:0}
+  .prices-bar {
+    display: flex; gap: 24px; padding: 14px 32px;
+    border-top: 1px solid var(--border);
+    font-family: 'Share Tech Mono', monospace; font-size: 0.85rem;
+    background: rgba(0,0,0,0.3);
+  }
+  .price-item { display: flex; gap: 8px; align-items: center; }
+  .price-label { color: var(--muted); font-size: 0.7rem; }
+  .price-up   { color: var(--green); font-size: 1.1rem; font-weight: bold; }
+  .price-down { color: var(--red);   font-size: 1.1rem; font-weight: bold; }
 
-/* refresh */
-.refresh{font-size:10px;color:var(--muted);text-align:right;margin-bottom:8px}
+  .empty { color: var(--muted); padding: 20px; text-align: center; font-size: 0.8rem; }
 
-/* scrollable */
-.scroll-area{max-height:260px;overflow-y:auto}
-.scroll-area::-webkit-scrollbar{width:4px}
-.scroll-area::-webkit-scrollbar-track{background:#111}
-.scroll-area::-webkit-scrollbar-thumb{background:#2a2e3a;border-radius:2px}
-
-@media(max-width:700px){
-  .grid-4,.grid-3{grid-template-columns:1fr 1fr}
-  .grid-2{grid-template-columns:1fr}
-}
+  footer { text-align: center; padding: 20px; color: var(--muted); font-size: 0.7rem; letter-spacing: 1px; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="logo">BTC <span>15m</span> Bot</div>
-    <div style="display:flex;gap:10px;align-items:center">
-      <span id="marketBadge" class="badge">⟳ Checking…</span>
-      <span style="color:var(--muted);font-size:11px" id="lastUpdate">—</span>
-    </div>
-  </header>
 
-  <!-- KPI row -->
-  <div class="grid-4">
-    <div class="card">
-      <div class="card-head">Balance</div>
-      <div class="card-val" id="balance">$2,000.00</div>
-      <div class="card-sub" id="pnlBadge">—</div>
-    </div>
-    <div class="card">
-      <div class="card-head">BTC Price</div>
-      <div class="card-val blue" id="btcPrice">—</div>
-      <div class="card-sub">Binance spot</div>
-    </div>
-    <div class="card">
-      <div class="card-head">Win Rate</div>
-      <div class="card-val" id="winRate">—</div>
-      <div class="card-sub" id="wlRecord">0W / 0L</div>
-    </div>
-    <div class="card">
-      <div class="card-head">Total Bets</div>
-      <div class="card-val amber" id="totalBets">0</div>
-      <div class="card-sub" id="openCount">0 open positions</div>
+<header>
+  <h1>⚡ Polymarket Demo Bot</h1>
+  <div style="display:flex;gap:12px;align-items:center;">
+    <span style="font-size:0.72rem;color:var(--muted)">{{ status }}</span>
+    <span class="badge">● DEMO LIVE</span>
+  </div>
+</header>
+
+<div class="grid">
+  <div class="stat">
+    <div class="stat-label">Balance</div>
+    <div class="stat-value cyan">${{ "%.2f"|format(balance) }}</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">P&amp;L</div>
+    <div class="stat-value {% if pnl >= 0 %}green{% else %}red{% endif %}">
+      ${{ "%+.2f"|format(pnl) }}
     </div>
   </div>
-
-  <div class="grid-3">
-    <!-- Signal -->
-    <div id="signalBox" class="signal-box wait">
-      <div class="card-head">Signal</div>
-      <div class="signal-dir muted" id="signalDir">WAITING</div>
-      <div class="signal-prob" id="signalProb">Model probability: —</div>
-      <ul class="reasons" id="signalReasons" style="margin-top:10px;text-align:left"></ul>
-    </div>
-
-    <!-- RSI + indicators -->
-    <div class="card">
-      <div class="card-head">RSI (14)</div>
-      <div class="card-val" id="rsiVal">50</div>
-      <div class="bar-track">
-        <div class="bar-fill" id="rsiBar" style="width:50%;background:var(--blue)"></div>
-      </div>
-      <div class="card-sub" style="margin-top:10px">RSI &lt; 35 = oversold · RSI &gt; 65 = overbought</div>
-
-      <div style="margin-top:14px">
-        <div class="card-head">Edge Required</div>
-        <div style="font-size:11px;color:var(--subtext)">Min edge: <span class="green">{MIN_EDGE_PCT}%</span> &nbsp;|&nbsp; Min prob: <span class="green">{MIN_PROB_PCT}%</span></div>
-      </div>
-    </div>
-
-    <!-- BTC sparkline -->
-    <div class="card">
-      <div class="card-head">BTC Price (last 60 ticks)</div>
-      <canvas id="spark"></canvas>
-      <div class="card-sub" id="sparkStatus" style="margin-top:6px">Collecting data…</div>
+  <div class="stat">
+    <div class="stat-label">P&amp;L %</div>
+    <div class="stat-value {% if pnl >= 0 %}green{% else %}red{% endif %}">
+      {{ "%+.1f"|format(pnl_pct) }}%
     </div>
   </div>
-
-  <div class="grid-2">
-    <!-- Open positions -->
-    <div class="card">
-      <div class="card-head">Open Positions</div>
-      <div id="openPositions" class="scroll-area" style="margin-top:4px">
-        <div class="muted" style="font-size:12px;padding:8px 0">No open positions</div>
-      </div>
-    </div>
-
-    <!-- Status & market -->
-    <div class="card">
-      <div class="card-head">Bot Status</div>
-      <div id="botStatus" style="font-size:12px;margin-bottom:12px">—</div>
-      <div class="card-head">Current Market</div>
-      <div id="marketSlug" style="font-size:11px;color:var(--blue);word-break:break-all">—</div>
-      <div id="marketEndTime" style="font-size:11px;color:var(--muted);margin-top:4px">—</div>
+  <div class="stat">
+    <div class="stat-label">Wins / Losses</div>
+    <div class="stat-value gold">{{ wins }} / {{ losses }}</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Win Rate</div>
+    <div class="stat-value {% if winrate >= 50 %}green{% else %}red{% endif %}">
+      {{ "%.0f"|format(winrate) }}%
     </div>
   </div>
-
-  <!-- Trade history -->
-  <div class="card">
-    <div class="card-head">Trade History (last 50)</div>
-    <div class="scroll-area" style="margin-top:8px">
-      <table>
-        <thead><tr>
-          <th>Time</th><th>Market</th><th>Dir</th><th>Stake</th>
-          <th>Entry</th><th>Edge</th><th>Result</th><th>PnL</th>
-        </tr></thead>
-        <tbody id="tradeBody">
-          <tr><td colspan="8" class="muted" style="text-align:center;padding:16px">No trades yet</td></tr>
-        </tbody>
-      </table>
-    </div>
+  <div class="stat">
+    <div class="stat-label">Open Positions</div>
+    <div class="stat-value cyan">{{ open_count }}</div>
   </div>
-
-  <div class="refresh" id="refreshNote">Auto-refreshes every 10 seconds</div>
+  <div class="stat">
+    <div class="stat-label">Window</div>
+    <div class="stat-value" style="font-size:1.1rem;color:var(--yellow)">{{ secs_left }}s left</div>
+  </div>
 </div>
 
-<script>
-const MIN_EDGE_PCT = "{MIN_EDGE_PCT}";
-const MIN_PROB_PCT = "{MIN_PROB_PCT}";
+<div class="prices-bar">
+  <div class="price-item">
+    <span class="price-label">BTC UP</span>
+    <span class="price-up">{{ "%.3f"|format(price_up) }}</span>
+  </div>
+  <div class="price-item">
+    <span class="price-label">BTC DOWN</span>
+    <span class="price-down">{{ "%.3f"|format(price_down) }}</span>
+  </div>
+  <div class="price-item" style="margin-left:auto">
+    <span class="price-label">Strategy: Liquidity Fade | Buy ≤ 0.35 | TP=0.55 | SL=0.15</span>
+  </div>
+</div>
 
-function fmt(n){return n===null||n===undefined?'—':Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}
-function fmtPct(n){return n===null||n===undefined?'—':(n*100).toFixed(1)+'%'}
-function timeAgo(iso){
-  if(!iso) return '—';
-  const d=new Date(iso);const now=new Date();
-  const s=Math.round((now-d)/1000);
-  if(s<5)return 'just now';if(s<60)return s+'s ago';
-  const m=Math.round(s/60);if(m<60)return m+'m ago';
-  return d.toLocaleTimeString();
-}
+<div class="main">
 
-let sparkData=[];
+  <!-- Open Positions -->
+  <div class="panel">
+    <div class="panel-head">Open Positions ({{ open_count }})</div>
+    {% if positions %}
+    <table>
+      <tr><th>Side</th><th>Shares</th><th>Entry</th><th>Current</th><th>Unreal PnL</th></tr>
+      {% for p in positions %}
+      <tr>
+        <td><span class="pill pill-{{ p.side.lower() }}">{{ p.side }}</span></td>
+        <td>{{ p.shares }}</td>
+        <td>{{ "%.3f"|format(p.entry) }}</td>
+        <td>{{ "%.3f"|format(prices.get(p.side, p.entry)) }}</td>
+        <td class="{% if p.upnl >= 0 %}log-win{% else %}log-loss{% endif %}">
+          ${{ "%+.2f"|format(p.upnl) }}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}
+    <div class="empty">No open positions</div>
+    {% endif %}
+  </div>
 
-function drawSpark(data){
-  const c=document.getElementById('spark');
-  if(!c)return;
-  const ctx=c.getContext('2d');
-  c.width=c.offsetWidth||300;c.height=60;
-  if(data.length<2){ctx.clearRect(0,0,c.width,c.height);return;}
-  const prices=data.map(d=>d.p);
-  const mn=Math.min(...prices),mx=Math.max(...prices);
-  const rng=mx-mn||1;
-  const w=c.width,h=c.height;
-  ctx.clearRect(0,0,w,h);
-  const grad=ctx.createLinearGradient(0,0,0,h);
-  grad.addColorStop(0,'rgba(61,158,255,0.3)');
-  grad.addColorStop(1,'rgba(61,158,255,0)');
-  ctx.beginPath();
-  data.forEach((d,i)=>{
-    const x=i/(data.length-1)*w;
-    const y=h-(d.p-mn)/rng*(h-6)-3;
-    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
-  });
-  const lastY=h-(prices[prices.length-1]-mn)/rng*(h-6)-3;
-  ctx.strokeStyle='#3d9eff';ctx.lineWidth=1.5;ctx.stroke();
-  ctx.lineTo(w,h);ctx.lineTo(0,h);ctx.closePath();
-  ctx.fillStyle=grad;ctx.fill();
-}
+  <!-- Live Log -->
+  <div class="panel">
+    <div class="panel-head">Live Event Log</div>
+    <div class="log-box">
+      {% for e in log %}
+      <div class="log-entry">
+        <span class="log-t">{{ e.t }}</span>
+        <span class="log-{{ e.level }}">{{ e.msg }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
 
-async function refresh(){
-  try{
-    const r=await fetch('/api/state');
-    const d=await r.json();
+</div>
 
-    // Balance
-    document.getElementById('balance').textContent='$'+fmt(d.balance);
-    const pnl=d.balance-d.initial;
-    const pnlEl=document.getElementById('pnlBadge');
-    pnlEl.textContent=(pnl>=0?'+':'')+fmt(pnl)+' ('+(pnl/d.initial*100).toFixed(1)+'%)';
-    pnlEl.className='card-sub '+(pnl>=0?'green':'red');
+<!-- Trade History -->
+<div style="padding: 0 32px 16px;">
+  <div class="panel">
+    <div class="panel-head">Trade History ({{ history|length }})</div>
+    {% if history %}
+    <div style="max-height:280px;overflow-y:auto;">
+    <table>
+      <tr><th>#</th><th>Side</th><th>Shares</th><th>Entry</th><th>Exit</th><th>Reason</th><th>PnL</th></tr>
+      {% for h in history %}
+      <tr>
+        <td>{{ h.id }}</td>
+        <td><span class="pill pill-{{ h.side.lower() }}">{{ h.side }}</span></td>
+        <td>{{ h.shares }}</td>
+        <td>{{ "%.3f"|format(h.entry) }}</td>
+        <td>{{ "%.3f"|format(h.exit) }}</td>
+        <td>{{ h.close_reason }}</td>
+        <td class="{% if h.pnl >= 0 %}log-win{% else %}log-loss{% endif %}">
+          ${{ "%+.2f"|format(h.pnl) }}
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    </div>
+    {% else %}
+    <div class="empty">No closed trades yet</div>
+    {% endif %}
+  </div>
+</div>
 
-    // BTC price
-    if(d.btc_price) document.getElementById('btcPrice').textContent='$'+fmt(d.btc_price);
+<footer>DEMO MODE — No real money. Polymarket Liquidity Fade Bot v1.0</footer>
 
-    // Win rate
-    const wr=d.total_bets>0?Math.round(d.wins/d.total_bets*100):0;
-    const wrEl=document.getElementById('winRate');
-    wrEl.textContent=d.total_bets>0?wr+'%':'—';
-    wrEl.className='card-val '+(wr>=50?'green':'red');
-    document.getElementById('wlRecord').textContent=d.wins+'W / '+d.losses+'L';
-    document.getElementById('totalBets').textContent=d.total_bets;
-    document.getElementById('openCount').textContent=d.open_positions.length+' open position'+(d.open_positions.length!==1?'s':'');
-
-    // RSI
-    const rsi=d.rsi||50;
-    document.getElementById('rsiVal').textContent=rsi.toFixed(1);
-    const rsiBar=document.getElementById('rsiBar');
-    rsiBar.style.width=rsi+'%';
-    rsiBar.style.background=rsi<35?'var(--green)':rsi>65?'var(--red)':'var(--blue)';
-
-    // Signal
-    const sigBox=document.getElementById('signalBox');
-    const sigDir=document.getElementById('signalDir');
-    const sigProb=document.getElementById('signalProb');
-    const sigReas=document.getElementById('signalReasons');
-    if(d.signal==='UP'){
-      sigBox.className='signal-box up';
-      sigDir.className='signal-dir green';sigDir.textContent='▲ UP';
-    } else if(d.signal==='DOWN'){
-      sigBox.className='signal-box down';
-      sigDir.className='signal-dir red';sigDir.textContent='▼ DOWN';
-    } else {
-      sigBox.className='signal-box wait';
-      sigDir.className='signal-dir muted';sigDir.textContent='WAITING';
-    }
-    sigProb.textContent='Model probability: '+(d.signal_prob*100).toFixed(1)+'%';
-    sigReas.innerHTML=(d.signal_reasons||[]).slice(0,4).map(r=>'<li>'+r+'</li>').join('');
-
-    // Market badge
-    const badge=document.getElementById('marketBadge');
-    if(d.market_found){
-      badge.textContent='● Market Live';badge.style.color='var(--green)';badge.style.background='#0d1f0d';badge.style.borderColor='#1a3a1a';
-    } else {
-      badge.textContent='○ Seeking Market';badge.style.color='var(--amber)';badge.style.background='#1f1a0d';badge.style.borderColor='#3a2a1a';
-    }
-
-    // Status
-    document.getElementById('botStatus').innerHTML='<span class="dot '+(d.market_found?'green':'amber')+'"></span>'+d.status;
-    document.getElementById('marketSlug').textContent=d.last_market_slug||'—';
-    if(d.last_market_end_ts){
-      const end=new Date(d.last_market_end_ts*1000);
-      const now=new Date();
-      const secsLeft=Math.max(0,Math.round((end-now)/1000));
-      document.getElementById('marketEndTime').textContent='Resolves in: '+secsLeft+'s ('+end.toLocaleTimeString()+')';
-    }
-    document.getElementById('lastUpdate').textContent=timeAgo(d.last_update);
-
-    // Open positions
-    const opEl=document.getElementById('openPositions');
-    if(d.open_positions.length===0){
-      opEl.innerHTML='<div class="muted" style="font-size:12px;padding:8px 0">No open positions</div>';
-    } else {
-      opEl.innerHTML=d.open_positions.map(p=>{
-        const end=new Date(p.end_ts*1000);
-        const secsLeft=Math.max(0,Math.round((end-new Date())/1000));
-        return '<div class="pos-chip">'
-          +'<span class="'+(p.direction==='UP'?'green':'red')+'" style="font-weight:700">'+p.direction+'</span>'
-          +' &nbsp;<span class="amber">$'+fmt(p.stake)+'</span>'
-          +' &nbsp;<span class="muted">@'+fmt(p.entry_price*100)+'¢</span>'
-          +' &nbsp;<span style="float:right;color:var(--muted)">'+secsLeft+'s left</span>'
-          +'<div style="font-size:10px;color:var(--muted);margin-top:4px">'
-          +'Edge: '+(p.edge*100).toFixed(1)+'% | Prob: '+(p.prob*100).toFixed(1)+'% | BTC @ $'+fmt(p.btc_at_entry)
-          +'</div></div>';
-      }).join('');
-    }
-
-    // Sparkline
-    sparkData=d.btc_history||[];
-    drawSpark(sparkData);
-    if(sparkData.length>0) document.getElementById('sparkStatus').textContent='Latest: $'+fmt(sparkData[sparkData.length-1].p);
-
-    // Trade history
-    const tbody=document.getElementById('tradeBody');
-    if(d.trades.length===0){
-      tbody.innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:16px">No trades yet</td></tr>';
-    } else {
-      tbody.innerHTML=d.trades.map(t=>{
-        const won=t.won;
-        const ts=t.closed_at?new Date(t.closed_at).toLocaleTimeString():'—';
-        const shortSlug=t.slug?t.slug.replace('btc-updown-15m-',''):'—';
-        return '<tr>'
-          +'<td class="muted">'+ts+'</td>'
-          +'<td class="muted" style="font-size:10px">…'+shortSlug+'</td>'
-          +'<td class="'+(t.direction==='UP'?'green':'red')+'">'+t.direction+'</td>'
-          +'<td>$'+fmt(t.stake)+'</td>'
-          +'<td>'+(t.entry_price*100).toFixed(1)+'¢</td>'
-          +'<td class="muted">'+(t.edge*100).toFixed(1)+'%</td>'
-          +'<td class="'+(won?'green':'red')+'">'+(t.resolution||'—')+(won?' ✓':' ✗')+'</td>'
-          +'<td class="'+(t.pnl>=0?'green':'red')+'">'+(t.pnl>=0?'+':'')+fmt(t.pnl)+'</td>'
-          +'</tr>';
-      }).join('');
-    }
-  } catch(e){ console.error('Refresh error',e); }
-}
-
-refresh();
-setInterval(refresh, 10000);
-window.addEventListener('resize',()=>drawSpark(sparkData));
-</script>
 </body>
 </html>
-""".replace("{MIN_EDGE_PCT}", str(int(MIN_EDGE*100))).replace("{MIN_PROB_PCT}", str(int(MIN_PROB*100)))
+"""
 
+@app.route("/")
+def dashboard():
+    with lock:
+        s = dict(state)
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # silence default access logs
+    prices = s["prices"]
+    now    = int(time.time())
+    wts    = s["window_ts"] or get_current_window_ts()
+    wend   = s["window_end"] or (wts + WINDOW_SECONDS)
+    secs_left = max(0, wend - now)
 
-    def do_GET(self):
-        if self.path == "/api/state":
-            with state_lock:
-                payload = {
-                    "balance": round(state["balance"], 2),
-                    "initial": state["initial"],
-                    "btc_price": state["btc_price"],
-                    "rsi": round(state["rsi"], 2),
-                    "signal": state["signal"],
-                    "signal_prob": state["signal_prob"],
-                    "signal_reasons": state["signal_reasons"],
-                    "open_positions": list(state["open_positions"]),
-                    "trades": list(state["trades"]),
-                    "last_market_slug": state["last_market_slug"],
-                    "last_market_end_ts": state["last_market_end_ts"],
-                    "status": state["status"],
-                    "market_found": state["market_found"],
-                    "last_update": state["last_update"],
-                    "btc_history": list(state["btc_history"]),
-                    "total_bets": state["total_bets"],
-                    "wins": state["wins"],
-                    "losses": state["losses"],
-                }
-            body = json.dumps(payload).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path in ("/", "/index.html"):
-            body = HTML_TEMPLATE.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
+    pnl     = s["balance"] - s["start_balance"]
+    pnl_pct = (pnl / s["start_balance"]) * 100
+    total   = s["wins"] + s["losses"]
+    winrate = (s["wins"] / total * 100) if total else 0.0
 
+    # Compute unrealized PnL for open positions
+    positions_view = []
+    for p in s["positions"]:
+        cur = prices.get(p["side"], p["entry"])
+        upnl = p["shares"] * cur * (1 - TAKER_FEE) - p["cost"]
+        pv = dict(p)
+        pv["upnl"] = upnl
+        positions_view.append(pv)
 
-def run_server():
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    log.info(f"Dashboard running on http://0.0.0.0:{PORT}")
-    server.serve_forever()
+    return render_template_string(
+        DASHBOARD_HTML,
+        balance   = s["balance"],
+        pnl       = pnl,
+        pnl_pct   = pnl_pct,
+        wins      = s["wins"],
+        losses    = s["losses"],
+        winrate   = winrate,
+        open_count= len(s["positions"]),
+        secs_left = secs_left,
+        price_up  = prices.get("UP") or 0.0,
+        price_down= prices.get("DOWN") or 0.0,
+        positions = positions_view,
+        history   = s["history"][:50],
+        log       = s["log"][:40],
+        prices    = prices,
+        status    = s["status"],
+    )
 
+@app.route("/api/state")
+def api_state():
+    with lock:
+        return jsonify(state)
 
-# ─────────────── ENTRY POINT ───────────────
-
+# ─── ENTRY POINT ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("=" * 50)
-    log.info("  Polymarket BTC 15m Demo Bot")
-    log.info(f"  Starting capital: ${DEMO_CAPITAL:,.2f}")
-    log.info(f"  Bet size: {int(BET_FRACTION*100)}% of balance")
-    log.info(f"  Min edge: {int(MIN_EDGE*100)}% | Min prob: {int(MIN_PROB*100)}%")
-    log.info(f"  Max open positions: {MAX_OPEN_TRADES}")
-    log.info("=" * 50)
-
-    # Start bot in background thread
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
-
-    # Run web server in main thread (Railway binds to PORT)
-    run_server()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
