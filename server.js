@@ -470,7 +470,7 @@ async function runMomentum(win, side, price, oppositePrice, secsLeft) {
 
   // ── Check entry ───────────────────────────────────────────────────────────
   if (secsLeft < CONFIG.MOMENTUM_MIN_TIME) return;
-  if (secsIntoWindow() > CONFIG.MOMENTUM_MAX_TIME) return;
+  if (secondsIntoWindow() > CONFIG.MOMENTUM_MAX_TIME) return;
   if (price < CONFIG.MOMENTUM_TRIGGER) return;
   // Don't enter momentum if opposite side is also high (indecision)
   if (oppositePrice > CONFIG.MOMENTUM_TRIGGER - 0.10) return;
