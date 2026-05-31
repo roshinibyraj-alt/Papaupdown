@@ -116,29 +116,70 @@ def find_btc_15m_market() -> dict | None:
     return None
 
 
-def get_clob_prices(condition_id: str) -> dict | None:
+def extract_prices_from_market(market: dict) -> dict | None:
     """
-    Get YES/NO mid-prices from Polymarket CLOB.
+    Extract YES/NO prices directly from a Gamma API market object.
+    Polymarket stores prices in several possible fields — we try them all.
     Returns {"yes": float, "no": float} or None.
     """
-    try:
-        r = requests.get(
-            f"https://clob.polymarket.com/markets/{condition_id}",
-            timeout=8,
-        )
-        r.raise_for_status()
-        data = r.json()
-        tokens = data.get("tokens", [])
+    # ── Method 1: tokens array (CLOB-style) ───────────────────────────────
+    tokens = market.get("tokens", [])
+    if tokens:
         prices = {}
         for tok in tokens:
             outcome = tok.get("outcome", "").upper()
-            price   = float(tok.get("price", 0))
-            if outcome in ("YES", "NO"):
-                prices[outcome.lower()] = price
+            price   = tok.get("price")
+            if price is not None and outcome in ("YES", "NO"):
+                prices[outcome.lower()] = float(price)
         if "yes" in prices and "no" in prices:
             return prices
-    except Exception as e:
-        log.warning(f"CLOB price fetch failed ({condition_id}): {e}")
+
+    # ── Method 2: outcomePrices JSON string + outcomes list ───────────────
+    outcome_prices_raw = market.get("outcomePrices")
+    outcomes_raw       = market.get("outcomes")
+    if outcome_prices_raw and outcomes_raw:
+        try:
+            op       = json.loads(outcome_prices_raw) if isinstance(outcome_prices_raw, str) else outcome_prices_raw
+            outcomes = json.loads(outcomes_raw)       if isinstance(outcomes_raw, str)       else outcomes_raw
+            prices   = {}
+            for label, price in zip(outcomes, op):
+                key = label.strip().lower()
+                # Map common labels to yes/no
+                if key in ("yes", "up", "higher", "above"):
+                    prices["yes"] = float(price)
+                elif key in ("no", "down", "lower", "below"):
+                    prices["no"] = float(price)
+            if "yes" in prices and "no" in prices:
+                return prices
+            # If only two prices and no label matched, assume first=yes second=no
+            if len(op) == 2 and "yes" not in prices:
+                return {"yes": float(op[0]), "no": float(op[1])}
+        except Exception as e:
+            log.debug(f"outcomePrices parse failed: {e}")
+
+    # ── Method 3: CLOB API fallback using conditionId ─────────────────────
+    condition_id = market.get("conditionId") or market.get("id")
+    if condition_id:
+        try:
+            r = requests.get(
+                f"https://clob.polymarket.com/markets/{condition_id}",
+                timeout=8,
+            )
+            r.raise_for_status()
+            data   = r.json()
+            tokens = data.get("tokens", [])
+            prices = {}
+            for tok in tokens:
+                outcome = tok.get("outcome", "").upper()
+                price   = tok.get("price")
+                if price is not None and outcome in ("YES", "NO"):
+                    prices[outcome.lower()] = float(price)
+            if "yes" in prices and "no" in prices:
+                log.debug("Prices sourced from CLOB API fallback")
+                return prices
+        except Exception as e:
+            log.debug(f"CLOB API fallback failed: {e}")
+
     return None
 
 
@@ -399,13 +440,12 @@ def run_cycle() -> None:
     else:
         log.info(f"  Market: {market.get('question', '')[:70]}")
 
-        condition_id = market.get("conditionId") or market.get("id")
-        clob_prices  = get_clob_prices(condition_id) if condition_id else None
+        clob_prices = extract_prices_from_market(market)
 
         if clob_prices:
             log.info(f"  Prices  YES={clob_prices['yes']:.3f}  NO={clob_prices['no']:.3f}")
         else:
-            log.warning("  Could not fetch CLOB prices — skipping trade")
+            log.warning("  Could not extract prices from market — skipping trade")
             clob_prices = None
 
         # 3. Resolve any open positions with latest prices
