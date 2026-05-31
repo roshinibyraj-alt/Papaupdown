@@ -44,7 +44,7 @@ const CONFIG = {
   GAMMA_URL:         'https://gamma-api.polymarket.com',
   CLOB_URL:          'https://clob.polymarket.com',
   PORT:              parseInt(process.env.PORT || 3000),
-  ASSETS:            ['btc', 'eth'],
+  ASSETS:            ['btc'],
   WINDOW_SEC:        300,
   PRICE_REFRESH_MS:  2000,   // poll every 2s for faster scalping
 
@@ -86,11 +86,11 @@ const CONFIG = {
 const state = {
   capital:      CONFIG.DEMO_CAPITAL,
   startCapital: CONFIG.DEMO_CAPITAL,
-  windows:      { btc: makeWindowState('btc'), eth: makeWindowState('eth') },
-  lastResolution: { btc: null, eth: null },  // per-slug resolution cache
+  windows:      { btc: makeWindowState('btc') },
+  lastResolution: { btc: null },  // per-slug resolution cache
   lastResBySlug:  {},                         // BUG1 FIX: slug → result
   history:      [],
-  prices:       { btc: null, eth: null },
+  prices:       { btc: null },
   logs:         [],
 };
 
@@ -133,6 +133,9 @@ function makeWindowState(asset) {
 
 const emitter = new EventEmitter();
 emitter.setMaxListeners(100);
+
+// Global monotonic order counter — never resets, guarantees unique trade IDs in logs
+let globalOrderSeq = 0;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  LOGGING
@@ -297,12 +300,13 @@ async function execBuy(win, side, shares, price, type) {
   else                 win.totalCostDown += cost;
 
   win.tradeCount++;
+  globalOrderSeq++;
   const orderId = uuidv4();
   win.orders.push({ id: orderId, side, type, action: 'BUY', shares, price, cost, pnl: null, time: new Date().toISOString() });
 
   log('info',
     `🟢 BUY  [${type}] ${win.asset.toUpperCase()} ${side} +${shares} @ ${price.toFixed(4)}` +
-    ` | Capital: $${state.capital.toFixed(2)} | #${win.tradeCount}`
+    ` | Capital: $${state.capital.toFixed(2)} | #${globalOrderSeq}`
   );
   emitter.emit('state_update', getPublicState());
   return orderId;
@@ -331,13 +335,14 @@ async function execSell(win, side, shares, price, type, costBasis) {
   state.capital      += proceeds;
   win.realizedPnl    += pnl;
   win.tradeCount++;
+  globalOrderSeq++;
 
   win.orders.push({ id: uuidv4(), side, type, action: 'SELL', shares, price, proceeds, pnl, time: new Date().toISOString() });
 
   const emoji = pnl >= 0 ? '🔴' : '🔻';
   log('info',
     `${emoji} SELL [${type}] ${win.asset.toUpperCase()} ${side} -${shares} @ ${price.toFixed(4)}` +
-    ` | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Capital: $${state.capital.toFixed(2)} | #${win.tradeCount}`
+    ` | PnL: ${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} | Capital: $${state.capital.toFixed(2)} | #${globalOrderSeq}`
   );
   emitter.emit('state_update', getPublicState());
   return true;
@@ -612,9 +617,11 @@ async function closeWindow(asset) {
 
   log('info', `⏸ Closing window: ${win.windowSlug}`);
 
-  // Emergency close any open positions
+  // Emergency close any open positions — use last known prices; fall back to 0.5 if unavailable
   const p = state.prices[asset];
-  if (p) await emergencyClose(win, p.up, p.down);
+  const upClose   = p?.up   ?? 0.5;
+  const downClose = p?.down ?? 0.5;
+  await emergencyClose(win, upClose, downClose);
 
   // BUG1 FIX: resolve with fallback — never leave lastResolution stale
   const result = await checkResolution(asset, win.windowSlug);
@@ -679,7 +686,7 @@ let priceTimers   = {};
 let windowChecker = null;
 
 function startMainLoop() {
-  log('info', '⚡ PULSE BOT v4.0 started — BTC & ETH 5-minute scalp/momentum/fade strategy');
+  log('info', '⚡ PULSE BOT v4.1 started — BTC 5-minute scalp/momentum/fade strategy');
 
   CONFIG.ASSETS.forEach(asset => {
     clearInterval(priceTimers[asset]);
@@ -716,11 +723,9 @@ function getPublicState() {
   const winRate = (wins + losses) > 0 ? ((wins / (wins + losses)) * 100).toFixed(1) : '0.0';
 
   const totalPnl = state.history.reduce((s, h) => s + (h.realizedPnl || 0), 0)
-    + (state.windows.btc?.realizedPnl || 0)
-    + (state.windows.eth?.realizedPnl || 0);
+    + (state.windows.btc?.realizedPnl || 0);
 
   const btcShares = openSharesCount(state.windows.btc || makeWindowState('btc'));
-  const ethShares = openSharesCount(state.windows.eth || makeWindowState('eth'));
 
   return {
     capital:       parseFloat(state.capital.toFixed(2)),
@@ -731,7 +736,6 @@ function getPublicState() {
 
     windows: {
       btc: serializeWindow(state.windows.btc, btcShares),
-      eth: serializeWindow(state.windows.eth, ethShares),
     },
     lastResolution: state.lastResolution,
     history:        state.history.slice(-60).reverse(),
@@ -800,23 +804,23 @@ app.get('*',           (_req, res) => res.sendFile(path.join(__dirname, 'public'
 server.listen(CONFIG.PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════╗
-║   POLYMARKET PULSE BOT v4.0 — ONLINE                     ║
+║   POLYMARKET PULSE BOT v4.1 — ONLINE                     ║
 ╠══════════════════════════════════════════════════════════╣
 ║   Dashboard : http://localhost:${CONFIG.PORT}                    ║
 ║   Mode      : ${CONFIG.DEMO_MODE ? 'DEMO (paper trading)            ' : 'LIVE (real trades!)              '}  ║
 ║   Strategy  : PULSE — Scalp + Momentum + Fade            ║
-║   Assets    : BTC & ETH 5-minute windows                 ║
+║   Assets    : BTC 5-minute windows only                  ║
 ╚══════════════════════════════════════════════════════════╝
 
   EDGE 1 — SCALP BAND  : 0.18–0.82 range, buy -0.04, sell +0.06
   EDGE 2 — MOMENTUM    : ride breakout above 0.72 → exit at 0.92
   EDGE 3 — FADE SPIKE  : buy loser when winner spikes to 0.84+
 
-  BUG FIXES vs v3:
-    ✅ Resolution no longer stuck on DOWN (per-slug cache + price fallback)
-    ✅ Base-exit-on-entry guard (skip if price >= 0.95 at window start)
-    ✅ Duplicate ladder buys eliminated (highestStepBought tracking)
-    ✅ baseShares correctly zeroed after BASE_EXIT sell
+  BUG FIXES vs v4.0:
+    ✅ secsIntoWindow ReferenceError fixed (→ secondsIntoWindow)
+    ✅ Global monotonic order ID counter (no more per-window resets)
+    ✅ closeWindow always closes positions (no longer skipped on null prices)
+    ✅ ETH pair removed — BTC only
   `);
   startMainLoop();
 });
