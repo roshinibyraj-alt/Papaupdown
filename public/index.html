@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>PULSE BOT v4.0 — POLYMARKET</title>
+<title>PULSE BOT v4.1 — POLYMARKET</title>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Barlow+Condensed:wght@700;800;900&display=swap" rel="stylesheet"/>
 <style>
 :root{
@@ -49,8 +49,8 @@ header{display:flex;align-items:center;justify-content:space-between;padding:12p
 main{padding:18px 22px;max-width:1800px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
 
 /* ── TOP STATS STRIP ────────────────────────────────── */
-.stat-row{display:grid;grid-template-columns:repeat(7,1fr);gap:10px}
-@media(max-width:1400px){.stat-row{grid-template-columns:repeat(4,1fr)}}
+.stat-row{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+@media(max-width:1400px){.stat-row{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:700px){.stat-row{grid-template-columns:repeat(2,1fr)}}
 .stat{background:var(--card);border:1px solid var(--b1);border-radius:11px;padding:13px 15px;position:relative;overflow:hidden}
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
@@ -78,7 +78,7 @@ main{padding:18px 22px;max-width:1800px;margin:0 auto;display:flex;flex-directio
 .sp-badge.fade{background:rgba(255,45,94,.1);color:var(--red);border:1px solid rgba(255,45,94,.25)}
 
 /* ── ASSET CARDS ────────────────────────────────────── */
-.asset-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.asset-row{display:grid;grid-template-columns:1fr;gap:14px;max-width:860px}
 @media(max-width:960px){.asset-row{grid-template-columns:1fr}}
 
 .asset-card{background:var(--card);border:1px solid var(--b1);border-radius:14px;overflow:hidden;transition:border-color .3s}
@@ -226,8 +226,8 @@ main{padding:18px 22px;max-width:1800px;margin:0 auto;display:flex;flex-directio
   <div class="logo">
     <div class="logo-icon">⚡</div>
     <div>
-      <div class="logo-name">PULSE BOT v4.0</div>
-      <div class="logo-sub">POLYMARKET · BTC/ETH · 5M · SCALP + MOMENTUM + FADE</div>
+      <div class="logo-name">PULSE BOT v4.1</div>
+      <div class="logo-sub">POLYMARKET · BTC · 5M · SCALP + MOMENTUM + FADE</div>
     </div>
   </div>
   <div class="hdr-right">
@@ -268,14 +268,14 @@ main{padding:18px 22px;max-width:1800px;margin:0 auto;display:flex;flex-directio
     <div class="stat-sub" id="btcPnl">this window</div>
   </div>
   <div class="stat c6">
-    <div class="stat-lbl">ETH TRADES</div>
-    <div class="stat-val" id="ethTrades" style="color:var(--orng)">—</div>
-    <div class="stat-sub" id="ethPnl">this window</div>
+    <div class="stat-lbl">OPEN LOTS</div>
+    <div class="stat-val" id="openLots" style="color:var(--orng)">—</div>
+    <div class="stat-sub" id="openLotsSub">this window</div>
   </div>
   <div class="stat c7">
     <div class="stat-lbl">LAST RESOLUTION</div>
     <div class="stat-val" id="lastRes" style="font-size:16px">—</div>
-    <div class="stat-sub">BTC &amp; ETH</div>
+    <div class="stat-sub">BTC last window</div>
   </div>
 </div>
 
@@ -438,18 +438,16 @@ function renderStats() {
   document.getElementById('wl').textContent = `W: ${S.wins} / L: ${S.losses}`;
 
   const btcW = S.windows?.btc;
-  const ethW = S.windows?.eth;
   set('btcTrades', btcW?.tradeCount ?? '—', 'var(--purp)');
   document.getElementById('btcPnl').textContent = btcW ? `${psign(btcW.realizedPnl)}$${fmt(btcW.realizedPnl)} PnL` : '—';
   document.getElementById('btcPnl').style.color = pcol(btcW?.realizedPnl || 0);
-  set('ethTrades', ethW?.tradeCount ?? '—', 'var(--orng)');
-  document.getElementById('ethPnl').textContent = ethW ? `${psign(ethW.realizedPnl)}$${fmt(ethW.realizedPnl)} PnL` : '—';
-  document.getElementById('ethPnl').style.color = pcol(ethW?.realizedPnl || 0);
+  const openLotsVal = (btcW?.openSharesTotal ?? 0);
+  set('openLots', openLotsVal, openLotsVal > 0 ? 'var(--orng)' : 'var(--txt2)');
+  document.getElementById('openLotsSub').textContent = btcW ? `${btcW.openSharesUp||0}↑ / ${btcW.openSharesDown||0}↓ shares` : '—';
 
   const btcRes = S.lastResolution?.btc;
-  const ethRes = S.lastResolution?.eth;
-  const resText = [btcRes && `BTC:${btcRes}`, ethRes && `ETH:${ethRes}`].filter(Boolean).join('  ') || '—';
-  set('lastRes', resText, (btcRes==='UP'||ethRes==='UP') ? 'var(--green)' : (btcRes||ethRes) ? 'var(--red)' : 'var(--txt2)');
+  const resText = btcRes ? `BTC: ${btcRes}` : '—';
+  set('lastRes', resText, btcRes === 'UP' ? 'var(--green)' : btcRes === 'DOWN' ? 'var(--red)' : 'var(--txt2)');
 }
 
 // ─── COUNTDOWN ───────────────────────────────────────────────────────────────
@@ -477,7 +475,7 @@ setInterval(() => {
 function renderAssets() {
   if (!S) return;
   document.getElementById('assetRow').innerHTML =
-    ['btc','eth'].map(a => buildAssetCard(a, S.windows?.[a], S.prices?.[a])).join('');
+    buildAssetCard('btc', S.windows?.btc, S.prices?.btc);
 }
 
 function buildAssetCard(asset, W, prices) {
@@ -642,7 +640,7 @@ function renderHistory() {
   }
   body.innerHTML = hist.map(h => {
     const pnlCol = h.realizedPnl >= 0 ? 'var(--green)' : 'var(--red)';
-    const slugShort = (h.slug||'').replace(/^(btc|eth)-updown-5m-/,'');
+    const slugShort = (h.slug||'').replace(/^btc-updown-5m-/,'');
     const resClass  = h.resolution === 'UP' ? 'UP' : h.resolution === 'DOWN' ? 'DOWN' : 'unknown';
     return `<div class="hist-row">
       <span class="hr-slug">${h.asset?.toUpperCase()} ${slugShort}</span>
