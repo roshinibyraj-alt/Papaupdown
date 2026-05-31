@@ -120,89 +120,109 @@ function makeSlug(asset, ts) {
 }
 
 // ─── POLYMARKET API ────────────────────────────────────────────────────────────
-async function fetchMarket(slug) {
+
+// Cache: slug → { upTokenId, downTokenId, marketId }
+const tokenCache = {};
+
+async function resolveMarketTokens(slug) {
+  if (tokenCache[slug]) return tokenCache[slug];
+
   try {
-    const headers = CONFIG.POLYMARKET_KEY
-      ? { Authorization: `Bearer ${CONFIG.POLYMARKET_KEY}` } : {};
-    const res = await axios.get(
-      `${CONFIG.GAMMA_URL}/markets?slug=${encodeURIComponent(slug)}`,
-      { headers, timeout: 8000 }
-    );
+    const res = await axios.get(`${CONFIG.GAMMA_URL}/markets`, {
+      params: { slug },
+      timeout: 8000,
+    });
     const list = Array.isArray(res.data) ? res.data : [res.data];
-    return list.find(m => m && (m.slug === slug || m.conditionId)) || null;
+    const market = list.find(m => m && m.slug === slug);
+    if (!market) {
+      log('warn', `Gamma API: market not found for slug ${slug}`);
+      return null;
+    }
+
+    const outcomes  = typeof market.outcomes     === 'string' ? JSON.parse(market.outcomes)     : (market.outcomes     || []);
+    const tokenIds  = typeof market.clobTokenIds === 'string' ? JSON.parse(market.clobTokenIds) : (market.clobTokenIds || []);
+
+    let upTokenId = null, downTokenId = null;
+    outcomes.forEach((o, i) => {
+      const n = (o || '').toLowerCase();
+      if (n === 'up')   upTokenId   = tokenIds[i];
+      if (n === 'down') downTokenId = tokenIds[i];
+    });
+    // fallback by index if outcome labels differ
+    if (!upTokenId   && tokenIds[0]) upTokenId   = tokenIds[0];
+    if (!downTokenId && tokenIds[1]) downTokenId = tokenIds[1];
+
+    const result = {
+      upTokenId,
+      downTokenId,
+      marketId:  market.id || market.conditionId,
+      closed:    !!market.closed,
+      resolved:  !!market.resolved,
+      market,
+    };
+    tokenCache[slug] = result;
+    log('info', `🔍 Market tokens resolved: ${slug}`, { upTokenId, downTokenId });
+    return result;
   } catch (err) {
-    log('error', `fetchMarket failed: ${slug}`, { error: err.message });
+    log('error', `resolveMarketTokens failed: ${slug}`, { error: err.message });
     return null;
   }
-}
-
-function parseOutcomes(market) {
-  const outcomes = typeof market.outcomes === 'string'
-    ? JSON.parse(market.outcomes) : (market.outcomes || []);
-  const rawPrices = typeof market.outcomePrices === 'string'
-    ? JSON.parse(market.outcomePrices) : (market.outcomePrices || []);
-
-  let up = null, down = null;
-  outcomes.forEach((o, i) => {
-    const n = (o || '').toLowerCase();
-    if (n === 'up')   up   = parseFloat(rawPrices[i]);
-    if (n === 'down') down = parseFloat(rawPrices[i]);
-  });
-  // fallback by index
-  if (up === null && rawPrices.length >= 2) {
-    up   = parseFloat(rawPrices[0]);
-    down = parseFloat(rawPrices[1]);
-  }
-  return { up, down };
 }
 
 async function fetchLivePrices(asset) {
   const ts   = currentWindowTs();
   const slug = makeSlug(asset, ts);
 
-  if (!CONFIG.DEMO_MODE) {
-    try {
-      const market = await fetchMarket(slug);
-      if (market) {
-        const { up, down } = parseOutcomes(market);
-        return { slug, marketId: market.id || market.conditionId, up, down, live: true };
-      }
-    } catch (err) { /* fall through to demo */ }
+  const tokens = await resolveMarketTokens(slug);
+  if (!tokens || !tokens.upTokenId || !tokens.downTokenId) {
+    log('warn', `fetchLivePrices: no token IDs for ${slug} — skipping`);
+    return null;
   }
 
-  // Demo: simulate prices with realistic drift
-  const prev = state.prices[asset];
-  let up   = prev?.up   ?? 0.50;
-  let down = prev?.down ?? 0.50;
+  try {
+    const [upRes, downRes] = await Promise.all([
+      axios.get(`${CONFIG.CLOB_URL}/midpoint`, { params: { token_id: tokens.upTokenId },   timeout: 5000 }),
+      axios.get(`${CONFIG.CLOB_URL}/midpoint`, { params: { token_id: tokens.downTokenId }, timeout: 5000 }),
+    ]);
 
-  // Drift
-  up   = Math.min(0.99, Math.max(0.01, up   + (Math.random() - 0.48) * 0.03));
-  down = parseFloat((1 - up).toFixed(4));
-  up   = parseFloat(up.toFixed(4));
+    const up   = parseFloat(upRes.data.mid);
+    const down = parseFloat(downRes.data.mid);
 
-  return {
-    slug,
-    marketId: `demo-${asset}-${ts}`,
-    up,
-    down,
-    live: false,
-  };
+    if (isNaN(up) || isNaN(down)) {
+      log('warn', `fetchLivePrices: NaN midpoint for ${slug}`, { upRaw: upRes.data, downRaw: downRes.data });
+      return null;
+    }
+
+    return { slug, marketId: tokens.marketId, up, down, live: true };
+  } catch (err) {
+    log('error', `fetchLivePrices CLOB midpoint failed: ${slug}`, { error: err.message });
+    return null;
+  }
 }
 
 async function checkResolution(asset, slug) {
-  if (CONFIG.DEMO_MODE) {
-    // Demo: resolve randomly
-    return Math.random() > 0.5 ? 'UP' : 'DOWN';
-  }
+  // Refresh cache for this slug (market may now be closed/resolved)
+  delete tokenCache[slug];
+  const tokens = await resolveMarketTokens(slug);
+  if (!tokens) return null;
+
+  if (!tokens.closed && !tokens.resolved) return null;
+
+  // Fetch final midpoints to determine winner
   try {
-    const market = await fetchMarket(slug);
-    if (!market || (!market.closed && !market.resolved)) return null;
-    const { up, down } = parseOutcomes(market);
-    if (up >= 0.99)   return 'UP';
+    const [upRes, downRes] = await Promise.all([
+      axios.get(`${CONFIG.CLOB_URL}/midpoint`, { params: { token_id: tokens.upTokenId },   timeout: 5000 }),
+      axios.get(`${CONFIG.CLOB_URL}/midpoint`, { params: { token_id: tokens.downTokenId }, timeout: 5000 }),
+    ]);
+    const up   = parseFloat(upRes.data.mid);
+    const down = parseFloat(downRes.data.mid);
+    if (up   >= 0.99) return 'UP';
     if (down >= 0.99) return 'DOWN';
+    // Resolved but prices not settled yet — use higher price
+    if (!isNaN(up) && !isNaN(down)) return up > down ? 'UP' : 'DOWN';
     return null;
   } catch (err) {
-    log('error', 'checkResolution failed', { slug, error: err.message });
+    log('error', 'checkResolution CLOB failed', { slug, error: err.message });
     return null;
   }
 }
@@ -398,17 +418,14 @@ async function startNewWindow(asset) {
     return;
   }
 
-  // Fetch market ID
-  let marketId = `demo-${asset}-${ts}`;
-  if (!CONFIG.DEMO_MODE) {
-    const market = await fetchMarket(slug);
-    if (!market) {
-      log('error', `Market not found: ${slug}`);
-      newLadder.status = 'WAITING';
-      return;
-    }
-    marketId = market.id || market.conditionId;
+  // Fetch market ID via real Gamma API (free, no auth)
+  const tokens = await resolveMarketTokens(slug);
+  if (!tokens) {
+    log('error', `Market not found on Gamma API: ${slug}`);
+    newLadder.status = 'WAITING';
+    return;
   }
+  const marketId = tokens.marketId;
 
   newLadder.side      = activeSide;
   newLadder.marketId  = marketId;
