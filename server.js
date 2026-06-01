@@ -150,7 +150,7 @@ const CONFIG = {
   // ── STRATEGY 2: LATE-WINDOW DIRECTIONAL ───────────────────────────────────
   // Only enter in the fee-friendly zone (p ≥ 0.88). Need Δ > 0.014 to break even.
   // In the last 180s prices accelerate toward 0/1 — achievable moves are 0.05-0.15.
-  LATE_DIR_ENABLED:   true,
+  LATE_DIR_ENABLED:   false,
   LATE_DIR_MIN_PRICE: 0.88,           // enter only when one side ≥ 0.88
   LATE_DIR_MIN_SECS:  30,             // need at least 30s left to enter
   LATE_DIR_MAX_SECS:  180,            // only enter in last 3 minutes
@@ -161,7 +161,7 @@ const CONFIG = {
   // ── STRATEGY 3: CROSS-ASSET LEAD-LAG ARB ─────────────────────────────────
   // BTC moves, ETH/SOL follow. Enter the lagging asset as maker.
   // Edge: correlated markets, 30-90s propagation lag.
-  CROSS_ARB_ENABLED:  true,
+  CROSS_ARB_ENABLED:  false,
   CROSS_ARB_LEAD_THRESH: 0.12,        // lead asset must move >12¢ from 0.50 to signal
   CROSS_ARB_LAG_MAX:     0.06,        // lag asset must still be within 6¢ of 0.50 (hasn't moved yet)
   CROSS_ARB_SHARES:   120,
