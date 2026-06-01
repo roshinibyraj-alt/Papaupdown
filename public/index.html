@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>PULSE v5 — FEE-AWARE ENGINE</title>
+<title>PULSE v5.2 — MAKER ENGINE</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;700;800;900&display=swap" rel="stylesheet"/>
 <style>
 :root{
@@ -151,7 +151,7 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
 /* ── STRATEGY CARDS ──────────────────────────── */
 .strat-list{display:flex;flex-direction:column;gap:6px}
 .strat-row{
-  display:grid;grid-template-columns:28px 1fr auto;gap:8px;align-items:center;
+  display:grid;grid-template-columns:28px 1fr auto auto;gap:8px;align-items:center;
   background:var(--card2);border:1px solid var(--b1);border-radius:7px;padding:8px 10px;
 }
 .strat-num{
@@ -161,8 +161,9 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
 .strat-info{}
 .strat-name{font-weight:700;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:2px}
 .strat-desc{font-size:8px;color:var(--txt2);line-height:1.5}
-.strat-pnl{font-family:var(--disp);font-weight:800;font-size:13px;text-align:right;white-space:nowrap}
-.strat-pnl-lbl{font-size:7px;color:var(--txt2);text-align:right;letter-spacing:1px}
+.strat-stat{text-align:right;white-space:nowrap;min-width:58px}
+.strat-stat-val{font-family:var(--disp);font-weight:800;font-size:13px}
+.strat-stat-lbl{font-size:7px;color:var(--txt2);letter-spacing:1px}
 
 /* ── ORDER BOOK ──────────────────────────────── */
 .order-row{
@@ -220,8 +221,8 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
   <div class="logo">
     <div class="logo-box">⚡</div>
     <div>
-      <div class="logo-text">PULSE v5.0</div>
-      <div class="logo-sub">FEE-AWARE ENGINE</div>
+      <div class="logo-text">PULSE v5.2</div>
+      <div class="logo-sub">DUAL MAKER ENGINE</div>
     </div>
   </div>
   <div class="hdr-right">
@@ -254,7 +255,7 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
     <div class="stat s4">
       <div class="stat-lbl">Fees Paid</div>
       <div id="stat-fees" class="stat-val neu">—</div>
-      <div class="stat-sub">taker only — maker=free</div>
+      <div class="stat-sub">S1+S4 = 100% maker = $0</div>
     </div>
     <div class="stat s5">
       <div class="stat-lbl">Window</div>
@@ -340,69 +341,54 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
     <!-- STRATEGIES -->
     <div class="card">
       <div class="card-head">
-        <div class="card-title">Strategy Suite</div>
-        <span class="card-badge badge-green">FEE-AWARE</span>
+        <div class="card-title">Active Strategies</div>
+        <span class="card-badge badge-green">100% MAKER — $0 FEES</span>
       </div>
       <div class="card-body">
         <div class="strat-list">
 
           <div class="strat-row">
-            <div class="strat-num" style="background:rgba(16,185,129,.15);color:var(--c3)">1</div>
+            <div class="strat-num" style="background:rgba(16,185,129,.15);color:var(--c3)">S1</div>
             <div class="strat-info">
               <div class="strat-name" style="color:var(--c3)">Maker Quote Engine</div>
               <div class="strat-desc">
-                Post limit orders ±2¢ from mid. <strong style="color:var(--c3)">Zero fees</strong> both legs.<br>
-                Earn pure spread ($4/100sh) + 20% maker rebate. Risk: adverse selection.
+                Post limit bids ±2¢ from mid. Fill on price cross, sell at +4¢.<br>
+                <strong style="color:var(--c3)">$0 fees</strong> both legs · $4.80/100sh · 120sh · 6 concurrent
               </div>
             </div>
             <div>
               <div id="s1-pnl" class="strat-pnl neu">$0.00</div>
-              <div class="strat-pnl-lbl">REALIZED</div>
+              <div class="strat-pnl-lbl">SESSION PnL</div>
             </div>
           </div>
 
           <div class="strat-row">
-            <div class="strat-num" style="background:rgba(0,229,255,.1);color:var(--c1)">2</div>
-            <div class="strat-info">
-              <div class="strat-name" style="color:var(--c1)">Late-Window Directional</div>
-              <div class="strat-desc">
-                Enter at p≥0.88 (fee &lt;1%). Target p=0.97 in last 180s.<br>
-                At 0.88→0.97: gross $9, fees $1.10, <strong style="color:var(--c3)">net $7.90/100sh</strong>.
-              </div>
-            </div>
-            <div>
-              <div id="s2-pnl" class="strat-pnl neu">$0.00</div>
-              <div class="strat-pnl-lbl">REALIZED</div>
-            </div>
-          </div>
-
-          <div class="strat-row">
-            <div class="strat-num" style="background:rgba(124,58,237,.15);color:var(--c2)">3</div>
-            <div class="strat-info">
-              <div class="strat-name" style="color:#a78bfa">Cross-Asset Lead-Lag</div>
-              <div class="strat-desc">
-                BTC leads ETH/SOL by 30-90s. When BTC moves 12¢+ from mid,<br>
-                enter lagging asset early. ~10% EV if corr holds. Fee-gated entry.
-              </div>
-            </div>
-            <div>
-              <div id="s3-pnl" class="strat-pnl neu">$0.00</div>
-              <div class="strat-pnl-lbl">REALIZED</div>
-            </div>
-          </div>
-
-          <div class="strat-row">
-            <div class="strat-num" style="background:rgba(6,182,212,.1);color:var(--c6)">4</div>
+            <div class="strat-num" style="background:rgba(6,182,212,.1);color:var(--c6)">S4</div>
             <div class="strat-info">
               <div class="strat-name" style="color:var(--c6)">Maker-Only Scalp</div>
               <div class="strat-desc">
-                Limit buy 3¢ below, limit sell 3¢ above. <strong style="color:var(--c3)">Zero fees</strong>.<br>
-                $6.00/100sh spread per RT. Cancel before window close.
+                Limit buy 2.5¢ below mid, limit sell 2.5¢ above. Requote on 2¢ drift.<br>
+                <strong style="color:var(--c3)">$0 fees</strong> both legs · $5.00/100sh · 80sh · 6 concurrent
               </div>
             </div>
             <div>
               <div id="s4-pnl" class="strat-pnl neu">$0.00</div>
-              <div class="strat-pnl-lbl">REALIZED</div>
+              <div class="strat-pnl-lbl">SESSION PnL</div>
+            </div>
+          </div>
+
+          <div class="strat-row" style="opacity:0.35">
+            <div class="strat-num" style="background:rgba(90,106,138,.1);color:var(--txt2)">—</div>
+            <div class="strat-info">
+              <div class="strat-name" style="color:var(--txt2)">S2 Late-Dir · S3 Cross-Arb</div>
+              <div class="strat-desc">
+                Removed after log analysis. S2: fired 2×/session (noise).<br>
+                S3: 59% fee drag + 10 trapped positions per window.
+              </div>
+            </div>
+            <div>
+              <div class="strat-pnl" style="color:var(--txt3)">OFF</div>
+              <div class="strat-pnl-lbl">DISABLED</div>
             </div>
           </div>
 
@@ -517,17 +503,13 @@ function render(s) {
   setText('stat-wr', `${s.winRate}%`);
   setText('stat-wl', `${s.wins}W / ${s.losses}L`);
   const fees = s.feeAnalytics?.totalFeePaid || 0;
-  setText('stat-fees', `$${fees.toFixed(3)}`);
+  setText('stat-fees', fees > 0 ? `$${fees.toFixed(3)}` : '$0.000');
   const secsLeft = s.windowSecsLeft;
   const secsIn   = s.windowSecsIn;
   setText('stat-window', secsLeft + 's left');
   setText('stat-secs', `${secsIn}s in / 900s`);
 
-  const totalTrades = s.history.reduce((a,h) => a + (h.tradeCount||0), 0);
-  const makerTrades = s.feeAnalytics?.makerTradeCount || 0;
-  const makerPct    = totalTrades > 0 ? ((makerTrades/totalTrades)*100).toFixed(0) : 0;
-  setText('stat-trades', totalTrades);
-  setText('stat-maker-pct', `${makerPct}% maker (free)`);
+  renderTradeCount(s);
 
   // Timer bar
   const pct = (secsIn / 900 * 100).toFixed(1);
@@ -584,35 +566,36 @@ function renderAssetPrices(s) {
 }
 
 function renderStrategyPnl(s) {
-  // Approximate PnL per strategy type from all history orders
-  const pnlByType = { MAKER_QUOTE: 0, LATE_DIR: 0, CROSS_ARB: 0, MAKER_SCALP: 0 };
+  const pnl = { MAKER_QUOTE: 0, MAKER_SCALP: 0 };
 
-  s.history.forEach(h => {
-    // We don't break down per strategy in history — show session totals
-  });
-
-  // For now show current window orders breakdown
+  // Accumulate from all windows (active + history orders)
   Object.values(s.windows || {}).forEach(w => {
     if (!w) return;
     (w.orders || []).filter(o => o.action === 'SELL' && o.pnl != null).forEach(o => {
       const t = o.type || '';
-      if (t.includes('MAKER_QUOTE'))  pnlByType.MAKER_QUOTE  += o.pnl;
-      else if (t.includes('LATE'))    pnlByType.LATE_DIR     += o.pnl;
-      else if (t.includes('CROSS'))   pnlByType.CROSS_ARB    += o.pnl;
-      else if (t.includes('MAKER_SCALP')) pnlByType.MAKER_SCALP += o.pnl;
+      if (t.includes('MAKER_QUOTE') || t.includes('MAKER_STOP')) pnl.MAKER_QUOTE += o.pnl;
+      else if (t.includes('MAKER_SCALP'))                        pnl.MAKER_SCALP += o.pnl;
     });
   });
 
-  const keys = ['MAKER_QUOTE','LATE_DIR','CROSS_ARB','MAKER_SCALP'];
-  const els  = ['s1-pnl','s2-pnl','s3-pnl','s4-pnl'];
-  keys.forEach((k,i) => {
-    const v = pnlByType[k];
-    const el = document.getElementById(els[i]);
+  [['s1-pnl', pnl.MAKER_QUOTE], ['s4-pnl', pnl.MAKER_SCALP]].forEach(([id, v]) => {
+    const el = document.getElementById(id);
     if (!el) return;
-    const sign = v >= 0 ? '+' : '';
-    el.textContent  = `${sign}$${v.toFixed(2)}`;
-    el.className = `strat-pnl ${v >= 0 ? 'pos' : 'neg'}`;
+    el.textContent = `${v >= 0 ? '+' : ''}$${v.toFixed(2)}`;
+    el.className   = `strat-pnl ${v > 0 ? 'pos' : v < 0 ? 'neg' : 'neu'}`;
   });
+}
+
+function renderTradeCount(s) {
+  // Include both history and all active windows
+  const histTrades   = s.history.reduce((a, h) => a + (h.tradeCount || 0), 0);
+  const activeTrades = Object.values(s.windows || {})
+    .reduce((a, w) => a + (w?.tradeCount || 0), 0);
+  const totalTrades  = histTrades + activeTrades;
+  const makerTrades  = s.feeAnalytics?.makerTradeCount || 0;
+  const makerPct     = totalTrades > 0 ? ((makerTrades / totalTrades) * 100).toFixed(0) : 100;
+  setText('stat-trades',    totalTrades);
+  setText('stat-maker-pct', `${makerPct}% maker (free)`);
 }
 
 function renderOrders(s) {
