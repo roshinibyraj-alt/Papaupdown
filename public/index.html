@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-<title>PULSE v5.2 — MAKER ENGINE</title>
+<title>PULSE v5.3 — MAKER ENGINE</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Syne:wght@400;700;800;900&display=swap" rel="stylesheet"/>
 <style>
 :root{
@@ -17,90 +17,57 @@
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html,body{background:var(--bg);color:var(--txt);font-family:var(--mono);min-height:100vh;font-size:12px;overflow-x:hidden}
-
-/* CRT grain */
-body::before{
-  content:'';position:fixed;inset:0;
-  background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");
-  pointer-events:none;z-index:999;opacity:.5;
-}
-
-/* scanlines */
-body::after{
-  content:'';position:fixed;inset:0;
-  background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.08) 3px,rgba(0,0,0,.08) 4px);
-  pointer-events:none;z-index:998;
-}
-
+body::before{content:'';position:fixed;inset:0;background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.04'/%3E%3C/svg%3E");pointer-events:none;z-index:999;opacity:.5}
+body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(0,0,0,.08) 3px,rgba(0,0,0,.08) 4px);pointer-events:none;z-index:998}
 #root{position:relative;z-index:1}
 
-/* ── HEADER ─────────────────────────────────── */
-header{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:10px 20px;border-bottom:1px solid var(--b1);
-  background:rgba(5,8,16,.97);backdrop-filter:blur(20px);
-  position:sticky;top:0;z-index:100;
-}
+/* HEADER */
+header{display:flex;align-items:center;justify-content:space-between;padding:10px 20px;border-bottom:1px solid var(--b1);background:rgba(5,8,16,.97);backdrop-filter:blur(20px);position:sticky;top:0;z-index:100}
 .logo{display:flex;align-items:center;gap:10px}
-.logo-box{
-  width:34px;height:34px;border-radius:8px;
-  background:linear-gradient(135deg,var(--c1),var(--c2));
-  display:grid;place-items:center;font-size:16px;flex-shrink:0;
-}
-.logo-text{font-family:var(--disp);font-weight:900;font-size:18px;letter-spacing:.5px;
-  background:linear-gradient(90deg,var(--c1),#a78bfa);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;}
+.logo-box{width:34px;height:34px;border-radius:8px;background:linear-gradient(135deg,var(--c1),var(--c2));display:grid;place-items:center;font-size:16px;flex-shrink:0}
+.logo-text{font-family:var(--disp);font-weight:900;font-size:18px;letter-spacing:.5px;background:linear-gradient(90deg,var(--c1),#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
 .logo-sub{font-size:8px;letter-spacing:3px;color:var(--c1);opacity:.6;margin-top:1px}
-
 .hdr-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.pill{display:flex;align-items:center;gap:5px;padding:4px 12px;border-radius:100px;
-  font-size:9px;font-weight:700;letter-spacing:1.5px;border:1px solid}
+.pill{display:flex;align-items:center;gap:5px;padding:4px 12px;border-radius:100px;font-size:9px;font-weight:700;letter-spacing:1.5px;border:1px solid}
 .pill.demo{border-color:var(--c5);color:var(--c5);background:rgba(245,158,11,.07)}
 .pill.live{border-color:var(--c3);color:var(--c3);background:rgba(16,185,129,.07)}
 .pill.fee{border-color:var(--c4);color:var(--c4);background:rgba(244,63,94,.07)}
 .dot{width:5px;height:5px;border-radius:50%;background:currentColor;animation:blink 1.4s infinite}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
+.ws-status{font-size:8px;display:flex;align-items:center;gap:4px}
+.ws-dot{width:5px;height:5px;border-radius:50%;background:var(--c4);animation:blink 2s infinite}
+.ws-dot.connected{background:var(--c3);animation:none}
 
-/* ── WINDOW TIMER ─────────────────────────────── */
+/* TIMER BAR */
 .tbar-wrap{padding:0 0 2px}
 .tbar{width:100%;height:3px;background:var(--b1)}
 .tbar-fill{height:100%;transition:width .5s linear;background:linear-gradient(90deg,var(--c1),var(--c2))}
 .tbar-fill.warn{background:linear-gradient(90deg,var(--c5),var(--c4))}
 
-/* ── MAIN LAYOUT ─────────────────────────────── */
+/* LAYOUT */
 main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-direction:column;gap:12px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+@media(max-width:1200px){.grid2,.grid3{grid-template-columns:1fr}}
 
-/* ── TOP STATS ───────────────────────────────── */
+/* STAT ROW */
 .stat-row{display:grid;grid-template-columns:repeat(7,1fr);gap:8px}
 @media(max-width:1400px){.stat-row{grid-template-columns:repeat(4,1fr)}}
 @media(max-width:700px){.stat-row{grid-template-columns:repeat(2,1fr)}}
-
-.stat{background:var(--card);border:1px solid var(--b1);border-radius:var(--rad);
-  padding:11px 13px;position:relative;overflow:hidden;cursor:default}
+.stat{background:var(--card);border:1px solid var(--b1);border-radius:var(--rad);padding:11px 13px;position:relative;overflow:hidden;cursor:default}
 .stat::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.stat.s1::before{background:var(--c1)}
-.stat.s2::before{background:var(--c5)}
-.stat.s3::before{background:var(--c3)}
-.stat.s4::before{background:var(--c4)}
-.stat.s5::before{background:var(--c2)}
-.stat.s6::before{background:var(--c6)}
+.stat.s1::before{background:var(--c1)}.stat.s2::before{background:var(--c5)}
+.stat.s3::before{background:var(--c3)}.stat.s4::before{background:var(--c4)}
+.stat.s5::before{background:var(--c2)}.stat.s6::before{background:var(--c6)}
 .stat.s7::before{background:linear-gradient(90deg,var(--c3),var(--c1))}
 .stat-lbl{font-size:8px;letter-spacing:2px;color:var(--txt2);text-transform:uppercase;margin-bottom:4px}
 .stat-val{font-family:var(--disp);font-weight:800;font-size:22px;line-height:1;letter-spacing:-.5px}
 .stat-sub{font-size:8px;color:var(--txt2);margin-top:3px}
 .pos{color:var(--c3)}.neg{color:var(--c4)}.neu{color:var(--txt)}
 
-/* ── MAIN GRID ───────────────────────────────── */
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-@media(max-width:1200px){.grid2,.grid3{grid-template-columns:1fr}}
-
-/* ── CARDS ───────────────────────────────────── */
+/* CARDS */
 .card{background:var(--card);border:1px solid var(--b1);border-radius:var(--rad);overflow:hidden}
-.card-head{
-  display:flex;align-items:center;justify-content:space-between;
-  padding:9px 13px;border-bottom:1px solid var(--b1);background:var(--card2);
-}
+.card-head{display:flex;align-items:center;justify-content:space-between;padding:9px 13px;border-bottom:1px solid var(--b1);background:var(--card2)}
 .card-title{font-family:var(--disp);font-weight:700;font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--txt2)}
 .card-badge{font-size:8px;padding:2px 8px;border-radius:100px;letter-spacing:1px;font-weight:700}
 .badge-green{background:rgba(16,185,129,.12);color:var(--c3);border:1px solid rgba(16,185,129,.3)}
@@ -108,111 +75,86 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
 .badge-red{background:rgba(244,63,94,.1);color:var(--c4);border:1px solid rgba(244,63,94,.25)}
 .badge-amber{background:rgba(245,158,11,.1);color:var(--c5);border:1px solid rgba(245,158,11,.25)}
 .card-body{padding:11px 13px}
+.empty{color:var(--txt3);font-size:9px;padding:12px 0;text-align:center}
 
-/* ── PRICE PANELS ────────────────────────────── */
-.asset-tabs{display:flex;gap:6px;margin-bottom:10px}
-.asset-tab{padding:4px 14px;border-radius:6px;font-size:9px;font-weight:700;letter-spacing:2px;cursor:pointer;
-  border:1px solid var(--b2);color:var(--txt2);background:transparent;transition:.15s}
+/* PRICE PANELS */
+.asset-tabs{display:flex;gap:6px}
+.asset-tab{padding:4px 14px;border-radius:6px;font-size:9px;font-weight:700;letter-spacing:2px;cursor:pointer;border:1px solid var(--b2);color:var(--txt2);background:transparent;transition:.15s}
 .asset-tab.active{background:rgba(0,229,255,.1);border-color:var(--c1);color:var(--c1)}
-
 .price-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
-.price-side{
-  background:var(--card2);border:1px solid var(--b1);border-radius:8px;
-  padding:10px 12px;position:relative;overflow:hidden;transition:.2s;
-}
-.price-side:hover{border-color:var(--b2)}
-.price-side::after{
-  content:'';position:absolute;top:0;left:0;bottom:0;width:3px;
-  background:var(--accent,var(--c1));border-radius:2px 0 0 2px;
-}
-.price-side.up-side{--accent:var(--c3)}
-.price-side.down-side{--accent:var(--c4)}
+.price-side{background:var(--card2);border:1px solid var(--b1);border-radius:8px;padding:10px 12px;position:relative;overflow:hidden;transition:.2s}
+.price-side::after{content:'';position:absolute;top:0;left:0;bottom:0;width:3px;background:var(--accent,var(--c1));border-radius:2px 0 0 2px}
+.price-side.up-side{--accent:var(--c3)}.price-side.down-side{--accent:var(--c4)}
 .ps-dir{font-size:8px;letter-spacing:2.5px;color:var(--txt2);margin-bottom:4px}
 .ps-price{font-family:var(--disp);font-size:28px;font-weight:800;letter-spacing:-1px;line-height:1}
 .ps-bar-wrap{height:3px;background:var(--b1);border-radius:2px;margin:6px 0 4px}
 .ps-bar{height:100%;border-radius:2px;transition:width .4s ease}
-.ps-bar.up-bar{background:var(--c3)}
-.ps-bar.dn-bar{background:var(--c4)}
+.ps-bar.up-bar{background:var(--c3)}.ps-bar.dn-bar{background:var(--c4)}
 .ps-stats{display:flex;gap:10px;flex-wrap:wrap}
-.ps-stat{font-size:8px;color:var(--txt2)}
-.ps-stat span{color:var(--txt)}
+.ps-stat{font-size:8px;color:var(--txt2)}.ps-stat span{color:var(--txt)}
 
-/* ── FEE HEATMAP ─────────────────────────────── */
+/* FEE HEATMAP */
 .fee-grid{display:grid;grid-template-columns:repeat(10,1fr);gap:3px}
-.fee-cell{
-  text-align:center;padding:5px 2px;border-radius:4px;font-size:7px;cursor:default;
-  transition:.15s;border:1px solid transparent;
-}
+.fee-cell{text-align:center;padding:5px 2px;border-radius:4px;font-size:7px;cursor:default;transition:.15s;border:1px solid transparent}
 .fee-cell:hover{border-color:var(--c1);z-index:2}
 .fee-cell .fc-p{font-weight:700;color:var(--txt);margin-bottom:2px}
-.fee-cell .fc-fee{color:var(--c4)}
-.fee-cell .fc-be{color:var(--txt2)}
+.fee-cell .fc-fee{color:var(--c4)}.fee-cell .fc-be{color:var(--txt2)}
+.fee-info{background:rgba(244,63,94,.05);border:1px solid rgba(244,63,94,.2);border-radius:8px;padding:10px 13px;margin-bottom:10px}
+.fee-info-title{font-size:8px;letter-spacing:2px;color:var(--c4);text-transform:uppercase;margin-bottom:6px;font-weight:700}
+.fee-formula{font-family:var(--mono);font-size:10px;color:var(--c5);margin-bottom:4px;background:rgba(0,0,0,.3);padding:5px 8px;border-radius:5px}
+.fee-note{font-size:8px;color:var(--txt2);line-height:1.6}
 
-/* ── STRATEGY CARDS ──────────────────────────── */
+/* STRATEGY CARDS */
 .strat-list{display:flex;flex-direction:column;gap:6px}
-.strat-row{
-  display:grid;grid-template-columns:28px 1fr auto auto;gap:8px;align-items:center;
-  background:var(--card2);border:1px solid var(--b1);border-radius:7px;padding:8px 10px;
-}
-.strat-num{
-  width:24px;height:24px;border-radius:5px;display:grid;place-items:center;
-  font-family:var(--disp);font-weight:800;font-size:11px;flex-shrink:0;
-}
-.strat-info{}
+.strat-row{display:grid;grid-template-columns:28px 1fr auto auto;gap:8px;align-items:center;background:var(--card2);border:1px solid var(--b1);border-radius:7px;padding:8px 10px}
+.strat-num{width:24px;height:24px;border-radius:5px;display:grid;place-items:center;font-family:var(--disp);font-weight:800;font-size:11px;flex-shrink:0}
 .strat-name{font-weight:700;font-size:9px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:2px}
 .strat-desc{font-size:8px;color:var(--txt2);line-height:1.5}
-.strat-stat{text-align:right;white-space:nowrap;min-width:58px}
+.strat-stat{text-align:right;white-space:nowrap;min-width:62px}
 .strat-stat-val{font-family:var(--disp);font-weight:800;font-size:13px}
-.strat-stat-lbl{font-size:7px;color:var(--txt2);letter-spacing:1px}
+.strat-stat-lbl{font-size:7px;color:var(--txt2);letter-spacing:1px;text-transform:uppercase;margin-top:1px}
 
-/* ── ORDER BOOK ──────────────────────────────── */
-.order-row{
-  display:grid;grid-template-columns:55px 45px 40px 40px 55px 55px 55px;
-  gap:4px;padding:4px 0;border-bottom:1px solid var(--b1);font-size:9px;align-items:center;
-}
+/* COMPOUNDING CHART */
+.compound-chart-wrap{width:100%;height:140px;position:relative;margin-bottom:10px}
+canvas#compound-canvas{width:100%;height:100%;display:block}
+.compound-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px}
+.cs-box{background:var(--card2);border:1px solid var(--b1);border-radius:7px;padding:8px 10px}
+.cs-lbl{font-size:7px;letter-spacing:1.5px;color:var(--txt2);text-transform:uppercase;margin-bottom:3px}
+.cs-val{font-family:var(--disp);font-weight:800;font-size:14px;letter-spacing:-.3px}
+.proj-table{width:100%;border-collapse:collapse;font-size:8px}
+.proj-table th{color:var(--txt3);letter-spacing:1.5px;font-size:7px;text-transform:uppercase;padding:3px 0;border-bottom:1px solid var(--b1);text-align:left}
+.proj-table td{padding:3px 0;border-bottom:1px solid rgba(18,24,58,.4);color:var(--txt)}
+.proj-table tr:last-child td{border:none}
+.proj-table .proj-day{color:var(--txt2)}.proj-table .proj-cap{color:var(--c3);font-weight:700}
+.proj-table .proj-ret{color:var(--c5)}.proj-table .proj-s1{color:var(--c3)}.proj-table .proj-s4{color:var(--c6)}
+
+/* SIM STATS */
+.sim-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.sim-box{background:var(--card2);border:1px solid var(--b1);border-radius:7px;padding:8px 10px}
+.sim-lbl{font-size:7px;letter-spacing:1.5px;color:var(--txt2);text-transform:uppercase;margin-bottom:3px}
+.sim-val{font-family:var(--disp);font-weight:800;font-size:16px;letter-spacing:-.3px}
+
+/* ORDERS */
+.order-row{display:grid;grid-template-columns:55px 45px 40px 40px 50px 60px 55px;gap:4px;padding:4px 0;border-bottom:1px solid var(--b1);font-size:9px;align-items:center}
 .order-row:last-child{border:none}
 .order-head{color:var(--txt3);font-size:7px;letter-spacing:1.5px;text-transform:uppercase}
 .ot-buy{color:var(--c3)}.ot-sell{color:var(--c4)}
 .maker-badge{font-size:6px;padding:1px 4px;border-radius:3px;background:rgba(16,185,129,.12);color:var(--c3);border:1px solid rgba(16,185,129,.2);white-space:nowrap}
 .taker-badge{font-size:6px;padding:1px 4px;border-radius:3px;background:rgba(244,63,94,.1);color:var(--c4);border:1px solid rgba(244,63,94,.2);white-space:nowrap}
 
-/* ── HISTORY TABLE ───────────────────────────── */
-.hist-row{
-  display:grid;grid-template-columns:65px 65px 55px 55px 65px 65px;
-  gap:4px;padding:4px 0;border-bottom:1px solid var(--b1);font-size:9px;align-items:center;
-}
+/* HISTORY */
+.hist-row{display:grid;grid-template-columns:55px 55px 45px 55px 70px 65px;gap:4px;padding:4px 0;border-bottom:1px solid var(--b1);font-size:9px;align-items:center}
 .hist-row:last-child{border:none}
 
-/* ── LOG FEED ─────────────────────────────────── */
-.log-feed{max-height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
-.log-entry{
-  display:grid;grid-template-columns:65px 40px 1fr;gap:6px;
-  font-size:8px;padding:3px 0;border-bottom:1px solid rgba(18,24,58,.5);
-}
+/* LOG FEED */
+.log-feed{max-height:220px;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
+.log-entry{display:grid;grid-template-columns:65px 40px 1fr;gap:6px;font-size:8px;padding:3px 0;border-bottom:1px solid rgba(18,24,58,.5)}
 .log-ts{color:var(--txt3)}.log-lvl{font-weight:700;letter-spacing:1px}
-.log-info .log-lvl{color:var(--c1)}
-.log-warn .log-lvl{color:var(--c5)}
-.log-error .log-lvl{color:var(--c4)}
-.log-debug .log-lvl{color:var(--txt3)}
+.log-info .log-lvl{color:var(--c1)}.log-warn .log-lvl{color:var(--c5)}
+.log-error .log-lvl{color:var(--c4)}.log-debug .log-lvl{color:var(--txt3)}
 .log-feed::-webkit-scrollbar{width:3px}
 .log-feed::-webkit-scrollbar-track{background:var(--b1)}
 .log-feed::-webkit-scrollbar-thumb{background:var(--b2);border-radius:2px}
-
-/* ── MISC ─────────────────────────────────────── */
-.ws-status{font-size:8px;display:flex;align-items:center;gap:4px}
-.ws-dot{width:5px;height:5px;border-radius:50%;background:var(--c4);animation:blink 2s infinite}
-.ws-dot.connected{background:var(--c3);animation:none}
-.section-sep{grid-column:1/-1;border-bottom:1px solid var(--b1);margin:2px 0}
-.empty{color:var(--txt3);font-size:9px;padding:12px 0;text-align:center}
-
-.fee-info{
-  background:rgba(244,63,94,.05);border:1px solid rgba(244,63,94,.2);
-  border-radius:8px;padding:10px 13px;margin-bottom:10px;
-}
-.fee-info-title{font-size:8px;letter-spacing:2px;color:var(--c4);text-transform:uppercase;margin-bottom:6px;font-weight:700}
-.fee-formula{font-family:var(--mono);font-size:10px;color:var(--c5);margin-bottom:4px;background:rgba(0,0,0,.3);padding:5px 8px;border-radius:5px}
-.fee-note{font-size:8px;color:var(--txt2);line-height:1.5}
-
 </style>
 </head>
 <body>
@@ -221,7 +163,7 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
   <div class="logo">
     <div class="logo-box">⚡</div>
     <div>
-      <div class="logo-text">PULSE v5.2</div>
+      <div class="logo-text">PULSE v5.3</div>
       <div class="logo-sub">DUAL MAKER ENGINE</div>
     </div>
   </div>
@@ -263,25 +205,25 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
       <div id="stat-secs" class="stat-sub">— / 900s</div>
     </div>
     <div class="stat s6">
-      <div class="stat-lbl">Trades</div>
-      <div id="stat-trades" class="stat-val neu">—</div>
-      <div id="stat-maker-pct" class="stat-sub">— maker</div>
+      <div class="stat-lbl">Round-Trips</div>
+      <div id="stat-rt" class="stat-val neu">—</div>
+      <div id="stat-blocked" class="stat-sub">— overfills blocked</div>
     </div>
     <div class="stat s7">
-      <div class="stat-lbl">Assets</div>
-      <div id="stat-assets" class="stat-val neu">BTC+ETH+SOL</div>
-      <div class="stat-sub">15-min windows</div>
+      <div class="stat-lbl">Position Size</div>
+      <div id="stat-shares" class="stat-val neu">—</div>
+      <div id="stat-shares-sub" class="stat-sub">S1 / S4 at p=0.50</div>
     </div>
   </div>
 
-  <!-- PRICES ROW -->
+  <!-- PRICES -->
   <div class="card">
     <div class="card-head">
       <div class="card-title">Live Prices</div>
       <div class="asset-tabs" id="asset-tabs">
-        <button class="asset-tab active" data-asset="btc" onclick="selectAsset('btc',this)">BTC</button>
-        <button class="asset-tab" data-asset="eth" onclick="selectAsset('eth',this)">ETH</button>
-        <button class="asset-tab" data-asset="sol" onclick="selectAsset('sol',this)">SOL</button>
+        <button class="asset-tab active" onclick="selectAsset('btc',this)">BTC</button>
+        <button class="asset-tab" onclick="selectAsset('eth',this)">ETH</button>
+        <button class="asset-tab" onclick="selectAsset('sol',this)">SOL</button>
       </div>
     </div>
     <div class="card-body">
@@ -294,6 +236,8 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
             <div class="ps-stat">fee/100: <span id="fee-up">—</span></div>
             <div class="ps-stat">BE_min: <span id="be-up">—</span></div>
             <div class="ps-stat">open: <span id="open-up">—</span></div>
+            <div class="ps-stat">S1sh: <span id="sh-s1-up">—</span></div>
+            <div class="ps-stat">S4sh: <span id="sh-s4-up">—</span></div>
           </div>
         </div>
         <div class="price-side down-side">
@@ -304,41 +248,114 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
             <div class="ps-stat">fee/100: <span id="fee-down">—</span></div>
             <div class="ps-stat">BE_min: <span id="be-down">—</span></div>
             <div class="ps-stat">open: <span id="open-down">—</span></div>
+            <div class="ps-stat">S1sh: <span id="sh-s1-down">—</span></div>
+            <div class="ps-stat">S4sh: <span id="sh-s4-down">—</span></div>
           </div>
         </div>
       </div>
     </div>
   </div>
 
-  <!-- FEE HEATMAP + STRATEGIES -->
+  <!-- COMPOUNDING + FEE HEATMAP -->
   <div class="grid2">
+
+    <!-- COMPOUNDING PANEL -->
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">Compounding Engine</div>
+        <span class="card-badge badge-green" id="compound-badge">0 windows</span>
+      </div>
+      <div class="card-body">
+        <!-- Growth chart -->
+        <div class="compound-chart-wrap">
+          <canvas id="compound-canvas"></canvas>
+        </div>
+        <!-- Key stats -->
+        <div class="compound-stats">
+          <div class="cs-box">
+            <div class="cs-lbl">Avg PnL / Window</div>
+            <div id="cs-avg" class="cs-val pos">$—</div>
+          </div>
+          <div class="cs-box">
+            <div class="cs-lbl">S1 Shares Now</div>
+            <div id="cs-s1" class="cs-val" style="color:var(--c3)">—sh</div>
+          </div>
+          <div class="cs-box">
+            <div class="cs-lbl">S4 Shares Now</div>
+            <div id="cs-s4" class="cs-val" style="color:var(--c6)">—sh</div>
+          </div>
+          <div class="cs-box">
+            <div class="cs-lbl">30-Day Projection</div>
+            <div id="cs-proj30" class="cs-val" style="color:var(--c5)">$—</div>
+          </div>
+        </div>
+        <!-- Projection table -->
+        <table class="proj-table" id="proj-table">
+          <thead>
+            <tr>
+              <th class="proj-day">Day</th>
+              <th class="proj-cap">Capital</th>
+              <th class="proj-ret">Return</th>
+              <th class="proj-s1">S1 Shares</th>
+              <th class="proj-s4">S4 Shares</th>
+            </tr>
+          </thead>
+          <tbody id="proj-tbody">
+            <tr><td colspan="5" class="empty">waiting for data…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
 
     <!-- FEE HEATMAP -->
     <div class="card">
       <div class="card-head">
-        <div class="card-title">Fee Heatmap — Crypto Taker Fee / 100 Shares</div>
-        <span class="card-badge badge-red">0 = MAKER</span>
+        <div class="card-title">Taker Fee Heatmap / 100 Shares</div>
+        <span class="card-badge badge-red">MAKER = $0</span>
       </div>
       <div class="card-body">
         <div class="fee-info">
           <div class="fee-info-title">Fee Formula</div>
           <div class="fee-formula">fee = 0.07 × shares × p × (1 - p)</div>
           <div class="fee-note">
-            Makers (limit orders) pay <strong style="color:var(--c3)">$0</strong> in fees.<br>
-            Peak: <strong style="color:var(--c4)">$1.75/100sh</strong> at p=0.50 (~3.5% round-trip).<br>
-            At p=0.90: <strong style="color:var(--c5)">$0.63/100sh</strong> (~0.7% one-way).<br>
-            At p=0.95: <strong style="color:var(--c3)">$0.33/100sh</strong> (~0.35% one-way).
+            Makers pay <strong style="color:var(--c3)">$0</strong>. Peak: <strong style="color:var(--c4)">$1.75/100sh</strong> at p=0.50.<br>
+            At p=0.90: <strong style="color:var(--c5)">$0.63/100sh</strong>. At p=0.95: <strong style="color:var(--c3)">$0.33/100sh</strong>.<br>
+            BE_min = minimum price move to break even (both legs taker).
           </div>
         </div>
         <div class="fee-grid" id="fee-heatmap"></div>
         <div style="margin-top:8px;font-size:8px;color:var(--txt2)">
-          <span style="color:var(--c4)">■</span> taker fee  &nbsp;
-          <span style="color:var(--txt2)">BE_min = min move to break even (both legs taker)</span>
+          <span style="color:var(--c4)">■</span> taker fee &nbsp;
+          <span style="color:var(--txt2)">bottom row = BE_min move</span>
+        </div>
+
+        <!-- SIM STATS (one-shot fix metrics) -->
+        <div style="margin-top:12px">
+          <div style="font-size:8px;letter-spacing:2px;color:var(--txt2);text-transform:uppercase;margin-bottom:6px">Demo Sim Stats (One-Shot Fix)</div>
+          <div class="sim-grid">
+            <div class="sim-box">
+              <div class="sim-lbl">Round-Trips</div>
+              <div id="sim-rt" class="sim-val" style="color:var(--c3)">0</div>
+            </div>
+            <div class="sim-box">
+              <div class="sim-lbl">Overfills Blocked</div>
+              <div id="sim-blocked" class="sim-val" style="color:var(--c5)">0</div>
+            </div>
+            <div class="sim-box">
+              <div class="sim-lbl">Avg Latency</div>
+              <div id="sim-latency" class="sim-val" style="color:var(--c6)">0ms</div>
+            </div>
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- STRATEGIES -->
+  </div>
+
+  <!-- STRATEGIES + ORDERS -->
+  <div class="grid2">
+
+    <!-- ACTIVE STRATEGIES -->
     <div class="card">
       <div class="card-head">
         <div class="card-title">Active Strategies</div>
@@ -352,13 +369,17 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
             <div class="strat-info">
               <div class="strat-name" style="color:var(--c3)">Maker Quote Engine</div>
               <div class="strat-desc">
-                Post limit bids ±2¢ from mid. Fill on price cross, sell at +4¢.<br>
-                <strong style="color:var(--c3)">$0 fees</strong> both legs · $4.80/100sh · 120sh · 6 concurrent
+                Resting bids ±2¢ · bid→ask array lifecycle · 3-tick cooldown<br>
+                <strong style="color:var(--c3)">$0 fees</strong> · $0.04/sh · 0.6% capital/bid · 6 bids + 6 asks
               </div>
             </div>
-            <div>
-              <div id="s1-pnl" class="strat-pnl neu">$0.00</div>
-              <div class="strat-pnl-lbl">SESSION PnL</div>
+            <div class="strat-stat">
+              <div id="s1-pnl" class="strat-stat-val neu">$0.00</div>
+              <div class="strat-stat-lbl">PnL</div>
+            </div>
+            <div class="strat-stat">
+              <div id="s1-loss" class="strat-stat-val" style="color:var(--txt2)">$0.00</div>
+              <div class="strat-stat-lbl">LOSS</div>
             </div>
           </div>
 
@@ -367,41 +388,37 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
             <div class="strat-info">
               <div class="strat-name" style="color:var(--c6)">Maker-Only Scalp</div>
               <div class="strat-desc">
-                Limit buy 2.5¢ below mid, limit sell 2.5¢ above. Requote on 2¢ drift.<br>
-                <strong style="color:var(--c3)">$0 fees</strong> both legs · $5.00/100sh · 80sh · 6 concurrent
+                Resting bids ±2.5¢ · requote on 2¢ drift · 3-tick cooldown<br>
+                <strong style="color:var(--c3)">$0 fees</strong> · $0.05/sh · 0.4% capital/bid · 6 bids + 6 asks
               </div>
             </div>
-            <div>
-              <div id="s4-pnl" class="strat-pnl neu">$0.00</div>
-              <div class="strat-pnl-lbl">SESSION PnL</div>
+            <div class="strat-stat">
+              <div id="s4-pnl" class="strat-stat-val neu">$0.00</div>
+              <div class="strat-stat-lbl">PnL</div>
+            </div>
+            <div class="strat-stat">
+              <div id="s4-loss" class="strat-stat-val" style="color:var(--txt2)">$0.00</div>
+              <div class="strat-stat-lbl">LOSS</div>
             </div>
           </div>
 
-          <div class="strat-row" style="opacity:0.35">
+          <div class="strat-row" style="opacity:0.3">
             <div class="strat-num" style="background:rgba(90,106,138,.1);color:var(--txt2)">—</div>
             <div class="strat-info">
               <div class="strat-name" style="color:var(--txt2)">S2 Late-Dir · S3 Cross-Arb</div>
               <div class="strat-desc">
-                Removed after log analysis. S2: fired 2×/session (noise).<br>
-                S3: 59% fee drag + 10 trapped positions per window.
+                Removed. S2: fired 2×/session (noise). S3: 59% fee drag + trapped positions.
               </div>
             </div>
-            <div>
-              <div class="strat-pnl" style="color:var(--txt3)">OFF</div>
-              <div class="strat-pnl-lbl">DISABLED</div>
-            </div>
+            <div class="strat-stat"><div class="strat-stat-val" style="color:var(--txt3)">OFF</div><div class="strat-stat-lbl">DISABLED</div></div>
+            <div class="strat-stat"><div class="strat-stat-val" style="color:var(--txt3)">—</div><div class="strat-stat-lbl">—</div></div>
           </div>
 
         </div>
       </div>
     </div>
 
-  </div>
-
-  <!-- ORDERS + HISTORY -->
-  <div class="grid2">
-
-    <!-- ORDER BOOK -->
+    <!-- ORDERS -->
     <div class="card">
       <div class="card-head">
         <div class="card-title">Recent Orders — <span id="orders-asset">BTC</span></div>
@@ -409,13 +426,18 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
       </div>
       <div class="card-body">
         <div class="order-row order-head">
-          <div>TYPE</div><div>SIDE</div><div>SHARES</div><div>PRICE</div><div>FEE</div><div>PnL</div><div>METHOD</div>
+          <div>TYPE</div><div>SIDE</div><div>SH</div><div>PRICE</div><div>FEE</div><div>PnL</div><div>METHOD</div>
         </div>
         <div id="orders-list"></div>
       </div>
     </div>
 
-    <!-- HISTORY -->
+  </div>
+
+  <!-- HISTORY + LOG -->
+  <div class="grid2">
+
+    <!-- WINDOW HISTORY -->
     <div class="card">
       <div class="card-head">
         <div class="card-title">Window History</div>
@@ -429,17 +451,17 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
       </div>
     </div>
 
-  </div>
+    <!-- LOG FEED -->
+    <div class="card">
+      <div class="card-head">
+        <div class="card-title">Event Log</div>
+        <span class="card-badge badge-blue" id="log-count">0 events</span>
+      </div>
+      <div class="card-body">
+        <div class="log-feed" id="log-feed"></div>
+      </div>
+    </div>
 
-  <!-- LOG FEED -->
-  <div class="card">
-    <div class="card-head">
-      <div class="card-title">Event Log</div>
-      <span class="card-badge badge-blue" id="log-count">0 events</span>
-    </div>
-    <div class="card-body">
-      <div class="log-feed" id="log-feed"></div>
-    </div>
   </div>
 
 </main>
@@ -450,176 +472,259 @@ main{padding:14px 18px;max-width:1920px;margin:0 auto;display:flex;flex-directio
 let currentAsset = 'btc';
 let lastState    = null;
 let ws           = null;
+let compoundCtx  = null;
 
-// Fee calc (mirrors server)
-function takerFeePerShare(p){ return 0.07 * p * (1-p); }
-function takerFee(shares, p){ return shares * takerFeePerShare(p); }
-function breakEvenMove(p){
-  const num = 2 * 0.07 * p * (1-p);
-  const den = 1 - 0.07 * (1 - 2*p);
-  return num/den;
+// Mirror server fee math
+function takerFeePerShare(p){ return 0.07*p*(1-p); }
+function takerFee(sh,p){ return sh*takerFeePerShare(p); }
+function breakEvenMove(p){ return (2*0.07*p*(1-p))/(1-0.07*(1-2*p)); }
+// Mirror server calcShares
+function calcShares(capital, risk, price, minSh, maxSh){
+  const raw = capital * risk / Math.max(price, 0.05);
+  const rounded = Math.floor(raw/5)*5;
+  return Math.min(maxSh, Math.max(minSh, rounded));
 }
 
 // ── FEE HEATMAP ──────────────────────────────────────────────────────────────
 function buildFeeHeatmap() {
-  const prices = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.70, 0.80, 0.85, 0.90, 0.95, 0.97, 0.99];
+  const prices = [0.05,0.10,0.15,0.20,0.25,0.30,0.40,0.50,0.70,0.80,0.85,0.90,0.95,0.97,0.99];
   const el = document.getElementById('fee-heatmap');
   el.innerHTML = '';
-  const maxFee = 1.75;  // at p=0.50
-
   prices.forEach(p => {
-    const fee = takerFee(100, p);
+    const fee = takerFee(100,p);
     const be  = breakEvenMove(p);
-    const intensity = fee / maxFee;
-    const r = Math.round(244 * intensity);
-    const g = Math.round(63  * (1-intensity) + 185 * intensity * 0.2);
-    const b = Math.round(94  * intensity);
+    const intensity = fee/1.75;
+    const r=Math.round(244*intensity), g=Math.round(63*(1-intensity)+185*intensity*0.2), b=Math.round(94*intensity);
     const cell = document.createElement('div');
     cell.className = 'fee-cell';
-    cell.style.background = `rgba(${r},${g/3},${b},${0.08 + intensity*0.25})`;
+    cell.style.background = `rgba(${r},${g/3},${b},${0.08+intensity*0.25})`;
     cell.style.borderColor = `rgba(${r},${g/3},${b},${intensity*0.4})`;
-    cell.innerHTML = `
-      <div class="fc-p">${p.toFixed(2)}</div>
-      <div class="fc-fee">$${fee.toFixed(2)}</div>
-      <div class="fc-be">+${be.toFixed(3)}</div>
-    `;
-    cell.title = `p=${p} | fee/100sh=$${fee.toFixed(3)} | break-even move: +${be.toFixed(4)}`;
+    cell.innerHTML = `<div class="fc-p">${p.toFixed(2)}</div><div class="fc-fee">$${fee.toFixed(2)}</div><div class="fc-be">+${be.toFixed(3)}</div>`;
+    cell.title = `p=${p} | fee=$${fee.toFixed(3)} | BE_min=+${be.toFixed(4)}`;
     el.appendChild(cell);
   });
 }
 
-// ── RENDER STATE ─────────────────────────────────────────────────────────────
+// ── COMPOUNDING CHART ─────────────────────────────────────────────────────────
+function renderCompoundChart(snapshots) {
+  const canvas = document.getElementById('compound-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width  = canvas.offsetWidth  * window.devicePixelRatio;
+  canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+
+  if (!snapshots || snapshots.length < 2) {
+    ctx.fillStyle = '#2a3a5a';
+    ctx.font = '10px Space Mono';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for window data…', W/2, H/2);
+    return;
+  }
+
+  const caps   = snapshots.map(s => s.capital);
+  const minCap = Math.min(...caps) * 0.99;
+  const maxCap = Math.max(...caps) * 1.01;
+  const range  = maxCap - minCap || 1;
+
+  const padL=8, padR=8, padT=8, padB=8;
+  const chartW = W - padL - padR;
+  const chartH = H - padT - padB;
+
+  const toX = i => padL + (i/(snapshots.length-1))*chartW;
+  const toY = v => padT + chartH - ((v-minCap)/range)*chartH;
+
+  // Fill under line
+  ctx.beginPath();
+  ctx.moveTo(toX(0), toY(caps[0]));
+  caps.forEach((c,i) => ctx.lineTo(toX(i), toY(c)));
+  ctx.lineTo(toX(caps.length-1), H);
+  ctx.lineTo(toX(0), H);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0, 'rgba(16,185,129,0.25)');
+  grad.addColorStop(1, 'rgba(16,185,129,0.02)');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  ctx.strokeStyle = '#10b981';
+  ctx.lineWidth   = 1.5;
+  caps.forEach((c,i) => i===0 ? ctx.moveTo(toX(0),toY(c)) : ctx.lineTo(toX(i),toY(c)));
+  ctx.stroke();
+
+  // Start / end labels
+  ctx.fillStyle = '#5a6a8a';
+  ctx.font = '7px Space Mono';
+  ctx.textAlign = 'left';
+  ctx.fillText(`$${caps[0].toFixed(0)}`, padL+2, padT+10);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#10b981';
+  ctx.font = 'bold 8px Space Mono';
+  ctx.fillText(`$${caps[caps.length-1].toFixed(0)}`, W-padR-2, padT+10);
+}
+
+// ── RENDER PROJECTION TABLE ───────────────────────────────────────────────────
+function renderProjTable(projections, startCap, s) {
+  const tbody = document.getElementById('proj-tbody');
+  if (!projections || !projections.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">Need more windows for projection…</td></tr>';
+    return;
+  }
+  const cfg = s?.config || {};
+  const days = [1,3,7,14,30];
+  tbody.innerHTML = days.map(d => {
+    const row = projections.find(p => p.day === d);
+    if (!row) return '';
+    const ret = ((row.capital - startCap)/startCap*100).toFixed(1);
+    const s1  = calcShares(row.capital, cfg.MAKER_RISK_PER_TRADE||0.006, 0.50, cfg.MAKER_MIN_SHARES||20, cfg.MAKER_MAX_SHARES||400);
+    const s4  = calcShares(row.capital, cfg.MAKER_SCALP_RISK_PER_TRADE||0.004, 0.50, cfg.MAKER_SCALP_MIN_SHARES||15, cfg.MAKER_SCALP_MAX_SHARES||300);
+    return `<tr>
+      <td class="proj-day">Day ${d}</td>
+      <td class="proj-cap">$${row.capital.toLocaleString('en',{maximumFractionDigits:0})}</td>
+      <td class="proj-ret">+${ret}%</td>
+      <td class="proj-s1">${s1}sh</td>
+      <td class="proj-s4">${s4}sh</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── MAIN RENDER ───────────────────────────────────────────────────────────────
 function render(s) {
   lastState = s;
 
-  // Stats
-  const pnlSign = s.totalPnl >= 0 ? '+' : '';
-  const retSign = s.totalReturn >= 0 ? '+' : '';
-  setText('stat-capital', `$${s.capital.toFixed(2)}`);
+  // Top stats
+  setText('stat-capital',     `$${s.capital.toFixed(2)}`);
   setText('stat-capital-sub', `started $${s.startCapital}`);
-  setText('stat-pnl', `${pnlSign}$${s.totalPnl.toFixed(2)}`);
-  setClass('stat-pnl', s.totalPnl >= 0 ? 'stat-val pos' : 'stat-val neg');
-  setText('stat-return', `${retSign}${s.totalReturn}% return`);
-  setText('stat-wr', `${s.winRate}%`);
-  setText('stat-wl', `${s.wins}W / ${s.losses}L`);
+  const pSign = s.totalPnl >= 0 ? '+' : '';
+  setText('stat-pnl',    `${pSign}$${s.totalPnl.toFixed(2)}`);
+  setClass('stat-pnl',   s.totalPnl >= 0 ? 'stat-val pos' : 'stat-val neg');
+  setText('stat-return', `${pSign}${s.totalReturn}% return`);
+  setText('stat-wr',     `${s.winRate}%`);
+  setText('stat-wl',     `${s.wins}W / ${s.losses}L`);
   const fees = s.feeAnalytics?.totalFeePaid || 0;
-  setText('stat-fees', fees > 0 ? `$${fees.toFixed(3)}` : '$0.000');
-  const secsLeft = s.windowSecsLeft;
-  const secsIn   = s.windowSecsIn;
-  setText('stat-window', secsLeft + 's left');
-  setText('stat-secs', `${secsIn}s in / 900s`);
+  setText('stat-fees',   fees > 0 ? `$${fees.toFixed(3)}` : '$0.000');
+  setText('stat-window', `${s.windowSecsLeft}s left`);
+  setText('stat-secs',   `${s.windowSecsIn}s in / 900s`);
 
-  renderTradeCount(s);
+  // Round-trips / overfills
+  const rt      = s.simStats?.roundTrips      || 0;
+  const blocked = s.simStats?.overfillsBlocked|| 0;
+  setText('stat-rt',      rt.toLocaleString());
+  setText('stat-blocked', `${blocked.toLocaleString()} overfills blocked`);
+  setText('sim-rt',       rt.toLocaleString());
+  setText('sim-blocked',  blocked.toLocaleString());
+  setText('sim-latency',  `${s.simStats?.avgLatencyMs || 0}ms`);
+
+  // Compounded share sizes
+  const cmp = s.compounding || {};
+  const cfg = s.config || {};
+  const s1sh = cmp.currentSharesS1 || '—';
+  const s4sh = cmp.currentSharesS4 || '—';
+  setText('stat-shares',     `${s1sh} / ${s4sh}`);
+  setText('stat-shares-sub', 'S1 / S4 at p=0.50');
+  setText('cs-s1', `${s1sh}sh`);
+  setText('cs-s4', `${s4sh}sh`);
+  setText('cs-avg', cmp.avgPnlPerWindow != null ? `$${cmp.avgPnlPerWindow.toFixed(2)}` : '$—');
+  setText('compound-badge', `${cmp.windowsRun || 0} windows`);
+  const proj30 = cmp.projections ? cmp.projections[cmp.projections.length-1]?.capital : null;
+  setText('cs-proj30', proj30 ? `$${proj30.toLocaleString('en',{maximumFractionDigits:0})}` : '$—');
 
   // Timer bar
-  const pct = (secsIn / 900 * 100).toFixed(1);
   const fill = document.getElementById('tbar-fill');
-  fill.style.width = pct + '%';
-  fill.classList.toggle('warn', secsLeft < 90);
+  fill.style.width = (s.windowSecsIn/900*100).toFixed(1) + '%';
+  fill.classList.toggle('warn', s.windowSecsLeft < 90);
 
   // Mode pill
   const mp = document.getElementById('mode-pill');
   mp.className = s.demoMode ? 'pill demo' : 'pill live';
   mp.innerHTML = `<span class="dot"></span> ${s.demoMode ? 'DEMO' : 'LIVE'}`;
 
-  // Prices for selected asset
+  // Prices
   renderAssetPrices(s);
 
-  // Strategy PnL breakdown by trade type (approximate from orders)
+  // Strategy PnL + loss
   renderStrategyPnl(s);
 
-  // Orders
+  // Compounding chart + table
+  renderCompoundChart(cmp.snapshots);
+  renderProjTable(cmp.projections, s.startCapital, s);
+
+  // Orders, history, logs
   renderOrders(s);
-
-  // History
   renderHistory(s);
-
-  // Logs
   renderLogs(s);
 }
 
 function renderAssetPrices(s) {
-  const w = s.windows?.[currentAsset];
-  const p = s.prices?.[currentAsset];
-
+  const w  = s.windows?.[currentAsset];
+  const p  = s.prices?.[currentAsset];
+  const cfg= s.config || {};
   if (!p) return;
 
-  const up   = p.up;
-  const down = p.down;
-
-  setText('price-up',   up   ? up.toFixed(3)   : '—');
-  setText('price-down', down ? down.toFixed(3) : '—');
-
-  if (up) {
-    document.getElementById('bar-up').style.width = (up * 100) + '%';
-    setText('fee-up',  `$${takerFee(100, up).toFixed(2)}`);
-    setText('be-up',   `+${breakEvenMove(up).toFixed(4)}`);
+  setText('price-up',   p.up   ? p.up.toFixed(3)   : '—');
+  setText('price-down', p.down ? p.down.toFixed(3) : '—');
+  if (p.up) {
+    document.getElementById('bar-up').style.width = (p.up*100)+'%';
+    setText('fee-up',    `$${takerFee(100,p.up).toFixed(2)}`);
+    setText('be-up',     `+${breakEvenMove(p.up).toFixed(4)}`);
+    setText('sh-s1-up',  calcShares(s.capital, cfg.MAKER_RISK_PER_TRADE||0.006, p.up, cfg.MAKER_MIN_SHARES||20, cfg.MAKER_MAX_SHARES||400)+'sh');
+    setText('sh-s4-up',  calcShares(s.capital, cfg.MAKER_SCALP_RISK_PER_TRADE||0.004, p.up, cfg.MAKER_SCALP_MIN_SHARES||15, cfg.MAKER_SCALP_MAX_SHARES||300)+'sh');
   }
-  if (down) {
-    document.getElementById('bar-down').style.width = (down * 100) + '%';
-    setText('fee-down', `$${takerFee(100, down).toFixed(2)}`);
-    setText('be-down',  `+${breakEvenMove(down).toFixed(4)}`);
+  if (p.down) {
+    document.getElementById('bar-down').style.width = (p.down*100)+'%';
+    setText('fee-down',    `$${takerFee(100,p.down).toFixed(2)}`);
+    setText('be-down',     `+${breakEvenMove(p.down).toFixed(4)}`);
+    setText('sh-s1-down',  calcShares(s.capital, cfg.MAKER_RISK_PER_TRADE||0.006, p.down, cfg.MAKER_MIN_SHARES||20, cfg.MAKER_MAX_SHARES||400)+'sh');
+    setText('sh-s4-down',  calcShares(s.capital, cfg.MAKER_SCALP_RISK_PER_TRADE||0.004, p.down, cfg.MAKER_SCALP_MIN_SHARES||15, cfg.MAKER_SCALP_MAX_SHARES||300)+'sh');
   }
-
   setText('open-up',   w ? (w.openSharesUp   || 0) : '—');
   setText('open-down', w ? (w.openSharesDown || 0) : '—');
 }
 
 function renderStrategyPnl(s) {
-  const pnl = { MAKER_QUOTE: 0, MAKER_SCALP: 0 };
+  const pnl  = { S1: 0, S4: 0 };
+  const loss = { S1: 0, S4: 0 };
 
-  // Accumulate from all windows (active + history orders)
   Object.values(s.windows || {}).forEach(w => {
     if (!w) return;
-    (w.orders || []).filter(o => o.action === 'SELL' && o.pnl != null).forEach(o => {
+    (w.orders || []).filter(o => o.action==='SELL' && o.pnl!=null).forEach(o => {
       const t = o.type || '';
-      if (t.includes('MAKER_QUOTE') || t.includes('MAKER_STOP')) pnl.MAKER_QUOTE += o.pnl;
-      else if (t.includes('MAKER_SCALP'))                        pnl.MAKER_SCALP += o.pnl;
+      const key = (t.includes('MAKER_QUOTE') || t.includes('MAKER_STOP')) ? 'S1'
+                : t.includes('MAKER_SCALP') ? 'S4' : null;
+      if (!key) return;
+      if (o.pnl >= 0) pnl[key]  += o.pnl;
+      else             loss[key] += o.pnl;
     });
   });
 
-  [['s1-pnl', pnl.MAKER_QUOTE], ['s4-pnl', pnl.MAKER_SCALP]].forEach(([id, v]) => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    el.textContent = `${v >= 0 ? '+' : ''}$${v.toFixed(2)}`;
-    el.className   = `strat-pnl ${v > 0 ? 'pos' : v < 0 ? 'neg' : 'neu'}`;
+  [['s1','S1'],['s4','S4']].forEach(([id,k]) => {
+    const pe = document.getElementById(`${id}-pnl`);
+    const le = document.getElementById(`${id}-loss`);
+    if (pe) { pe.textContent=`${pnl[k]>=0?'+':''}$${pnl[k].toFixed(2)}`; pe.className=`strat-stat-val ${pnl[k]>0?'pos':'neu'}`; }
+    if (le) { le.textContent=loss[k]<0?`-$${Math.abs(loss[k]).toFixed(2)}`:'$0.00'; le.className=`strat-stat-val ${loss[k]<0?'neg':''}`.trim(); }
   });
-}
-
-function renderTradeCount(s) {
-  // Include both history and all active windows
-  const histTrades   = s.history.reduce((a, h) => a + (h.tradeCount || 0), 0);
-  const activeTrades = Object.values(s.windows || {})
-    .reduce((a, w) => a + (w?.tradeCount || 0), 0);
-  const totalTrades  = histTrades + activeTrades;
-  const makerTrades  = s.feeAnalytics?.makerTradeCount || 0;
-  const makerPct     = totalTrades > 0 ? ((makerTrades / totalTrades) * 100).toFixed(0) : 100;
-  setText('stat-trades',    totalTrades);
-  setText('stat-maker-pct', `${makerPct}% maker (free)`);
 }
 
 function renderOrders(s) {
   const w = s.windows?.[currentAsset];
-  const orders = (w?.orders || []).slice().reverse().slice(0, 20);
+  const orders = (w?.orders || []).slice().reverse().slice(0,20);
   setText('orders-asset', currentAsset.toUpperCase());
   setText('orders-count', `${orders.length} trades`);
-
   const el = document.getElementById('orders-list');
-  if (!orders.length) { el.innerHTML = '<div class="empty">no orders yet</div>'; return; }
-
+  if (!orders.length) { el.innerHTML='<div class="empty">no orders yet</div>'; return; }
   el.innerHTML = orders.map(o => {
-    const isB   = o.action === 'BUY';
-    const pnlStr = o.pnl != null ? (o.pnl >= 0 ? `<span class="pos">+$${o.pnl.toFixed(3)}</span>` : `<span class="neg">$${o.pnl.toFixed(3)}</span>`) : '—';
-    const badge  = o.isMaker
-      ? '<span class="maker-badge">MAKER</span>'
-      : '<span class="taker-badge">TAKER</span>';
-    const feeStr = o.fee != null ? `$${parseFloat(o.fee).toFixed(3)}` : '—';
+    const isB    = o.action==='BUY';
+    const pnlStr = o.pnl!=null ? (o.pnl>=0?`<span class="pos">+$${o.pnl.toFixed(3)}</span>`:`<span class="neg">$${o.pnl.toFixed(3)}</span>`) : '—';
+    const badge  = o.isMaker ? '<span class="maker-badge">MAKER</span>' : '<span class="taker-badge">TAKER</span>';
     return `<div class="order-row">
-      <div class="${isB ? 'ot-buy' : 'ot-sell'}">${o.action}</div>
+      <div class="${isB?'ot-buy':'ot-sell'}">${o.action}</div>
       <div>${o.side}</div>
-      <div>${o.shares}</div>
-      <div>${parseFloat(o.price).toFixed(3)}</div>
-      <div>${feeStr}</div>
+      <div>${o.shares||o.fillShares||'—'}</div>
+      <div>${parseFloat(o.fillPrice||o.price||0).toFixed(3)}</div>
+      <div>$${parseFloat(o.fee||0).toFixed(3)}</div>
       <div>${pnlStr}</div>
       <div>${badge}</div>
     </div>`;
@@ -627,92 +732,75 @@ function renderOrders(s) {
 }
 
 function renderHistory(s) {
-  const hist = (s.history || []).slice(0, 20);
+  const hist = (s.history||[]).slice(0,20);
   setText('hist-count', `${hist.length} windows`);
-
   const el = document.getElementById('history-list');
-  if (!hist.length) { el.innerHTML = '<div class="empty">no history yet</div>'; return; }
-
+  if (!hist.length) { el.innerHTML='<div class="empty">no history yet</div>'; return; }
   el.innerHTML = hist.map(h => {
-    const pnl = h.realizedPnl || 0;
-    const fee = h.feePaid || 0;
-    const pnlCls = pnl >= 0 ? 'pos' : 'neg';
-    const resCls = h.resolution === 'UP' ? 'pos' : (h.resolution === 'DOWN' ? 'neg' : 'neu');
+    const pnl = h.realizedPnl||0;
+    const fee = h.feePaid||0;
+    const pCls = pnl>=0?'pos':'neg';
+    const rCls = h.resolution==='UP'?'pos':(h.resolution==='DOWN'?'neg':'neu');
     const t = h.closedAt ? new Date(h.closedAt).toLocaleTimeString() : '—';
     return `<div class="hist-row">
       <div>${(h.asset||'').toUpperCase()}</div>
-      <div class="${resCls}">${h.resolution||'?'}</div>
+      <div class="${rCls}">${h.resolution||'?'}</div>
       <div>${h.tradeCount||0}</div>
-      <div class="neg">$${fee.toFixed(3)}</div>
-      <div class="${pnlCls}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</div>
+      <div class="${fee>0?'neg':''}">$${fee.toFixed(3)}</div>
+      <div class="${pCls}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</div>
       <div style="color:var(--txt3)">${t}</div>
     </div>`;
   }).join('');
 }
 
 function renderLogs(s) {
-  const logs = (s.logs || []).slice(0, 60);
+  const logs = (s.logs||[]).slice(0,60);
   setText('log-count', `${logs.length} events`);
   const el = document.getElementById('log-feed');
   el.innerHTML = logs.map(l => {
-    const t   = l.ts ? l.ts.slice(11, 19) : '';
-    const lvl = (l.level || 'info').toLowerCase();
+    const t   = l.ts ? l.ts.slice(11,19) : '';
+    const lvl = (l.level||'info').toLowerCase();
     return `<div class="log-entry log-${lvl}">
       <div class="log-ts">${t}</div>
       <div class="log-lvl">${lvl.toUpperCase()}</div>
-      <div class="log-msg">${escHtml(l.msg || '')}</div>
+      <div class="log-msg">${escHtml(l.msg||'')}</div>
     </div>`;
   }).join('');
 }
 
-// ── ASSET SELECTOR ─────────────────────────────────────────────────────────
+// ── ASSET SELECTOR ────────────────────────────────────────────────────────────
 function selectAsset(asset, btn) {
   currentAsset = asset;
   document.querySelectorAll('.asset-tab').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
-  if (lastState) renderAssetPrices(lastState);
-  if (lastState) renderOrders(lastState);
+  if (lastState) { renderAssetPrices(lastState); renderOrders(lastState); }
 }
 
-// ── WEBSOCKET ────────────────────────────────────────────────────────────────
+// ── WEBSOCKET ─────────────────────────────────────────────────────────────────
 function connectWS() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const proto = location.protocol==='https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}`);
-
-  ws.onopen = () => {
-    document.getElementById('ws-dot').className = 'ws-dot connected';
-    document.getElementById('ws-lbl').textContent = 'LIVE';
-  };
-  ws.onclose = () => {
-    document.getElementById('ws-dot').className = 'ws-dot';
-    document.getElementById('ws-lbl').textContent = 'DISC';
-    setTimeout(connectWS, 3000);
-  };
-  ws.onmessage = e => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'FULL_STATE' || msg.type === 'STATE_UPDATE') render(msg.data);
-    } catch(_) {}
-  };
+  ws.onopen  = () => { document.getElementById('ws-dot').className='ws-dot connected'; document.getElementById('ws-lbl').textContent='LIVE'; };
+  ws.onclose = () => { document.getElementById('ws-dot').className='ws-dot'; document.getElementById('ws-lbl').textContent='DISC'; setTimeout(connectWS,3000); };
+  ws.onmessage = e => { try { const m=JSON.parse(e.data); if(m.type==='FULL_STATE'||m.type==='STATE_UPDATE') render(m.data); } catch(_){} };
 }
 
-// ── UTILS ────────────────────────────────────────────────────────────────────
-function setText(id, v) { const el = document.getElementById(id); if (el) el.textContent = v; }
-function setClass(id, c){ const el = document.getElementById(id); if (el) el.className = c; }
+// ── UTILS ─────────────────────────────────────────────────────────────────────
+function setText(id,v){ const el=document.getElementById(id); if(el) el.textContent=v; }
+function setClass(id,c){ const el=document.getElementById(id); if(el) el.className=c; }
 function escHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// ── INIT ─────────────────────────────────────────────────────────────────────
+// ── INIT ──────────────────────────────────────────────────────────────────────
 buildFeeHeatmap();
 connectWS();
 
-// Poll fallback
+// Redraw chart on resize
+window.addEventListener('resize', () => { if(lastState?.compounding) renderCompoundChart(lastState.compounding.snapshots); });
+
+// Poll fallback if WS drops
 setInterval(async () => {
-  if (ws && ws.readyState === WebSocket.OPEN) return;
-  try {
-    const r = await fetch('/api/state');
-    const s = await r.json();
-    render(s);
-  } catch(_) {}
+  if (ws && ws.readyState===WebSocket.OPEN) return;
+  try { const r=await fetch('/api/state'); render(await r.json()); } catch(_){}
 }, 3000);
 </script>
 </body>
