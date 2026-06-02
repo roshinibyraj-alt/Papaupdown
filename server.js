@@ -86,7 +86,7 @@ function breakEvenMove(p)     { return (2*0.07*p*(1-p)) / (1 - 0.07*(1-2*p)); }
 // price        = current mid price (affects how many shares $X buys)
 //
 function calcShares(riskFraction, price, minShares, maxShares) {
-  const rawDollars = state.capital * riskFraction;
+  const rawDollars = state.startCapital * riskFraction;  // fixed sizing: no compounding
   const rawShares  = rawDollars / Math.max(price, 0.05); // avoid div-by-zero at extremes
   const rounded    = Math.floor(rawShares / 5) * 5;      // round down to nearest 5
   return Math.min(maxShares, Math.max(minShares, rounded));
@@ -171,7 +171,7 @@ const CONFIG = {
   MAKER_SCALP_MAX_OPEN:     6,
   MAKER_SCALP_MAX_ASKS:     6,
   MAKER_SCALP_REQUOTE:      0.020,
-  MAKER_SCALP_ADV_SEL_STOP: 0.06,
+  MAKER_SCALP_ADV_SEL_STOP: 0.025,     // stop = half spread; reward 0.05 / risk 0.025 = 2:1 R:R
   MAKER_SCALP_COOLDOWN_TICKS: 3,
 
   EMERGENCY_SECS:  10,
@@ -533,7 +533,7 @@ async function runMakerQuoteEngine(win, side, price, secsLeft) {
     }
 
     // Stop: price fell 15¢ below our entry or window ending
-    if (price <= ask.limitPrice - 0.15 || secsLeft < 15) {
+    if (price <= ask.limitPrice - CONFIG.MAKER_SPREAD || secsLeft < 15) {  // stop = spread width; 1:1 R:R
       await execSell(win, side, ask.filledShares, price, 'MAKER_STOP', ask.cost, false);
       openAsks.splice(i, 1);
     }
