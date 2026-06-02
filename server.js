@@ -171,7 +171,7 @@ const CONFIG = {
   MAKER_SCALP_MAX_OPEN:     6,
   MAKER_SCALP_MAX_ASKS:     6,
   MAKER_SCALP_REQUOTE:      0.020,
-  MAKER_SCALP_ADV_SEL_STOP: 0.025,     // stop = half spread; reward 0.05 / risk 0.025 = 2:1 R:R
+  MAKER_SCALP_ADV_SEL_STOP: 0.06,
   MAKER_SCALP_COOLDOWN_TICKS: 3,
 
   EMERGENCY_SECS:  10,
@@ -503,6 +503,7 @@ function isCoolingDown(win, price) {
 async function runMakerQuoteEngine(win, side, price, secsLeft) {
   if (!CONFIG.MAKER_ENABLED) return;
   if (secsLeft < CONFIG.EMERGENCY_SECS + 5) return;
+  if (price < 0.20 || price > 0.80) return;  // no market-making outside 20-80 range
 
   const openBids = side==='UP' ? win.makerBidsUp   : win.makerBidsDown;
   const openAsks = side==='UP' ? win.makerAsksUp   : win.makerAsksDown;
@@ -533,7 +534,7 @@ async function runMakerQuoteEngine(win, side, price, secsLeft) {
     }
 
     // Stop: price fell 15¢ below our entry or window ending
-    if (price <= ask.limitPrice - CONFIG.MAKER_SPREAD || secsLeft < 15) {  // stop = spread width; 1:1 R:R
+    if (price <= ask.limitPrice - 0.15 || secsLeft < 15) {
       await execSell(win, side, ask.filledShares, price, 'MAKER_STOP', ask.cost, false);
       openAsks.splice(i, 1);
     }
@@ -618,7 +619,7 @@ async function runMakerQuoteEngine(win, side, price, secsLeft) {
 async function runMakerScalp(win, side, price, secsLeft) {
   if (!CONFIG.MAKER_SCALP_ENABLED) return;
   if (secsLeft < CONFIG.MAKER_SCALP_MIN_TIME) return;
-  if (price < 0.10 || price > 0.90) return;
+  if (price < 0.20 || price > 0.80) return;  // no market-making outside 20-80 range
 
   const openBids = side==='UP' ? win.makerScalpBidsUp   : win.makerScalpBidsDown;
   const openAsks = side==='UP' ? win.makerScalpAsksUp   : win.makerScalpAsksDown;
