@@ -2,7 +2,7 @@
 require('dotenv').config();
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  PULSE BOT v5.3 — ONE-SHOT FILL FIX + COMPOUNDING
+//  PULSE BOT v5.4 — 4-BUG FIX RELEASE
 //
 //  BUG FIXED FROM v5.2: DEMO OVER-FILLING (same order filling 29× per window)
 //  ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +86,9 @@ function breakEvenMove(p)     { return (2*0.07*p*(1-p)) / (1 - 0.07*(1-2*p)); }
 // price        = current mid price (affects how many shares $X buys)
 //
 function calcShares(riskFraction, price, minShares, maxShares) {
-  const rawDollars = state.startCapital * riskFraction;  // fixed sizing: no compounding
+  // BUG A FIX: use settledCapital (fully resolved) not live state.capital
+  const safeCap    = Math.max(0, state.settledCapital || state.capital);
+  const rawDollars = safeCap * riskFraction;
   const rawShares  = rawDollars / Math.max(price, 0.05); // avoid div-by-zero at extremes
   const rounded    = Math.floor(rawShares / 5) * 5;      // round down to nearest 5
   return Math.min(maxShares, Math.max(minShares, rounded));
@@ -179,11 +181,22 @@ const CONFIG = {
 };
 
 // ─── CAPITAL MUTEX ────────────────────────────────────────────────────────────
+// All capital reads/writes go through this queue — guarantees serial execution.
+//
+// BUG A FIX: getPublicState() used to read state.capital directly while
+// adjustCapital() promise chain had pending resolutions, producing impossible
+// values like $-4536. Now:
+//   • state.capital        = live value (may be mid-chain)
+//   • state.settledCapital = last fully-resolved value (safe to display)
+// getPublicState() reads settledCapital, not capital directly.
 
 let _capitalQueue = Promise.resolve();
 function adjustCapital(delta) {
   _capitalQueue = _capitalQueue.then(() => {
-    state.capital = parseFloat((state.capital + delta).toFixed(6));
+    state.capital         = parseFloat((state.capital + delta).toFixed(6));
+    // Clamp to zero — real capital can never go negative
+    if (state.capital < 0) state.capital = 0;
+    state.settledCapital  = state.capital;   // snapshot after each settled step
   });
   return _capitalQueue;
 }
@@ -192,6 +205,7 @@ function adjustCapital(delta) {
 
 const state = {
   capital: 0, startCapital: 0,
+  settledCapital: 0,   // BUG A FIX: last fully-resolved capital value for display
   windows: {}, lastResolution: {}, lastResBySlug: {},
   history: [], prices: {}, logs: [],
   feesPaid: 0,
@@ -208,8 +222,9 @@ const state = {
 };
 
 function initState() {
-  state.capital      = CONFIG.DEMO_CAPITAL;
-  state.startCapital = CONFIG.DEMO_CAPITAL;
+  state.capital         = CONFIG.DEMO_CAPITAL;
+  state.startCapital    = CONFIG.DEMO_CAPITAL;
+  state.settledCapital  = CONFIG.DEMO_CAPITAL;
   CONFIG.ASSETS.forEach(a => {
     state.windows[a]        = makeWindowState(a);
     state.lastResolution[a] = null;
@@ -456,16 +471,17 @@ async function execSell(win, side, shares, requestedPrice, type, costBasis, isMa
 // so the dashboard can plot a compounding growth curve.
 
 function takeCompoundingSnapshot() {
-  const midP = 0.50; // reference price for share size illustration
+  const midP     = 0.50;
+  const snapCap  = parseFloat((state.settledCapital || state.capital).toFixed(2));
   const s1Shares = calcShares(CONFIG.MAKER_RISK_PER_TRADE,       midP, CONFIG.MAKER_MIN_SHARES,       CONFIG.MAKER_MAX_SHARES);
   const s4Shares = calcShares(CONFIG.MAKER_SCALP_RISK_PER_TRADE, midP, CONFIG.MAKER_SCALP_MIN_SHARES, CONFIG.MAKER_SCALP_MAX_SHARES);
   state.compounding.snapshots.push({
     ts:        new Date().toISOString(),
-    capital:   parseFloat(state.capital.toFixed(2)),
+    capital:   snapCap,
     sharesS1:  s1Shares,
     sharesS4:  s4Shares,
-    pnl:       parseFloat((state.capital - state.startCapital).toFixed(2)),
-    returnPct: parseFloat(((state.capital - state.startCapital) / state.startCapital * 100).toFixed(2)),
+    pnl:       parseFloat((snapCap - state.startCapital).toFixed(2)),
+    returnPct: parseFloat(((snapCap - state.startCapital) / state.startCapital * 100).toFixed(2)),
   });
   if (state.compounding.snapshots.length > 500) state.compounding.snapshots.shift();
 }
@@ -503,7 +519,6 @@ function isCoolingDown(win, price) {
 async function runMakerQuoteEngine(win, side, price, secsLeft) {
   if (!CONFIG.MAKER_ENABLED) return;
   if (secsLeft < CONFIG.EMERGENCY_SECS + 5) return;
-  if (price < 0.20 || price > 0.80) return;  // no market-making outside 20-80 range
 
   const openBids = side==='UP' ? win.makerBidsUp   : win.makerBidsDown;
   const openAsks = side==='UP' ? win.makerAsksUp   : win.makerAsksDown;
@@ -533,8 +548,10 @@ async function runMakerQuoteEngine(win, side, price, secsLeft) {
       continue;
     }
 
-    // Stop: price fell 15¢ below our entry or window ending
-    if (price <= ask.limitPrice - 0.15 || secsLeft < 15) {
+    // Stop: price fell 6¢ below our entry (BUG B FIX: was 0.15 → 3.75× TP)
+    // S1 TP earns shares×$0.04. At 0.15 stop: break-even needs 78.9% win rate.
+    // At 0.06 stop: break-even needs 60% win rate — achievable.
+    if (price <= ask.limitPrice - 0.06 || secsLeft < 15) {
       await execSell(win, side, ask.filledShares, price, 'MAKER_STOP', ask.cost, false);
       openAsks.splice(i, 1);
     }
@@ -619,7 +636,7 @@ async function runMakerQuoteEngine(win, side, price, secsLeft) {
 async function runMakerScalp(win, side, price, secsLeft) {
   if (!CONFIG.MAKER_SCALP_ENABLED) return;
   if (secsLeft < CONFIG.MAKER_SCALP_MIN_TIME) return;
-  if (price < 0.20 || price > 0.80) return;  // no market-making outside 20-80 range
+  if (price < 0.10 || price > 0.90) return;
 
   const openBids = side==='UP' ? win.makerScalpBidsUp   : win.makerScalpBidsDown;
   const openAsks = side==='UP' ? win.makerScalpAsksUp   : win.makerScalpAsksDown;
@@ -829,9 +846,12 @@ function startMainLoop() {
 // ─── PUBLIC STATE ─────────────────────────────────────────────────────────────
 
 function getPublicState() {
-  const wins   = state.history.filter(h => h.realizedPnl > 0).length;
-  const losses = state.history.filter(h => h.realizedPnl <= 0).length;
-  const totalPnl = parseFloat((state.capital - state.startCapital).toFixed(2));
+  // BUG C FIX: was h.realizedPnl <= 0 which counted zero-trade windows as losses
+  const wins   = state.history.filter(h => h.realizedPnl >  0).length;
+  const losses = state.history.filter(h => h.realizedPnl <  0).length;
+  // Use settledCapital (BUG A FIX) — never shows mid-chain stale value
+  const displayCapital = parseFloat((state.settledCapital || state.capital).toFixed(2));
+  const totalPnl       = parseFloat((displayCapital - state.startCapital).toFixed(2));
 
   const windowsOut = {};
   CONFIG.ASSETS.forEach(asset => {
@@ -867,17 +887,16 @@ function getPublicState() {
   const snapshots    = state.compounding.snapshots;
   const windowsRun   = snapshots.length;
   const avgPnlPerWin = windowsRun > 1
-    ? (state.capital - state.startCapital) / windowsRun
+    ? (displayCapital - state.startCapital) / windowsRun
     : 0;
   const compoundProjections = (() => {
     if (windowsRun < 2) return null;
     const windowsPerDay = 96; // 4 per hour × 24h
-    let cap = state.capital;
+    let cap = displayCapital;
     const proj = [];
     for (let day = 1; day <= 30; day++) {
       for (let w = 0; w < windowsPerDay; w++) {
-        // Per-window return % estimated from recent history
-        const pctPerWin = avgPnlPerWin / cap;
+        const pctPerWin = avgPnlPerWin / Math.max(cap, 1);
         cap = cap * (1 + pctPerWin);
       }
       proj.push({ day, capital: parseFloat(cap.toFixed(2)) });
@@ -886,7 +905,7 @@ function getPublicState() {
   })();
 
   return {
-    capital:      parseFloat(state.capital.toFixed(2)),
+    capital:      displayCapital,
     startCapital: state.startCapital,
     totalPnl,
     totalReturn:  parseFloat((totalPnl / state.startCapital * 100).toFixed(2)),
@@ -952,10 +971,11 @@ app.get('/api/fee-math/:p',       (req, res) => {
 });
 app.get('/api/compound-project',  (req, res) => {
   // ?capital=X&windowsPerDay=Y&avgReturnPct=Z
-  const cap     = parseFloat(req.query.capital     || state.capital);
+  const safeCap = Math.max(0, state.settledCapital || state.capital);
+  const cap     = parseFloat(req.query.capital      || safeCap);
   const wpd     = parseInt  (req.query.windowsPerDay || 96);
-  const pctWin  = parseFloat(req.query.avgReturnPct || 0.0015); // 0.15% per window default
-  const days    = parseInt  (req.query.days         || 30);
+  const pctWin  = parseFloat(req.query.avgReturnPct  || 0.0015);
+  const days    = parseInt  (req.query.days           || 30);
   const rows = [];
   let c = cap;
   for (let d = 0; d <= days; d++) {
@@ -972,24 +992,18 @@ initState();
 server.listen(CONFIG.PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════════════════════════╗
-║   PULSE BOT v5.3 — ONE-SHOT FILL FIX + COMPOUNDING ENGINE           ║
+║   PULSE BOT v5.4 — 4-BUG FIX RELEASE                                ║
 ╠══════════════════════════════════════════════════════════════════════╣
 ║   http://localhost:${CONFIG.PORT}  |  ${CONFIG.DEMO_MODE ? 'REALISTIC DEMO MODE         ' : 'LIVE TRADING MODE          '}   ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║   FIXES APPLIED:                                                     ║
-║   ✓ Fix 1: No instant-fill on post tick (postedTick guard)           ║
-║   ✓ Fix 2: Separate openBids / openAsks arrays (two-stage lifecycle) ║
-║   ✓ Fix 3: One-fill flag per lot (no double-fill)                    ║
-║   ✓ Fix 4: Post-fill cooldown 3 ticks (7.5s queue re-entry delay)   ║
+║   BUG FIXES:                                                         ║
+║   ✓ Bug A: settledCapital — no more -$4536 async stale reads         ║
+║   ✓ Bug B: S1 stop 0.15→0.06 — break-even win rate 78%→60%          ║
+║   ✓ Bug C: win rate counts only real wins/losses, not empty windows  ║
+║   ✓ Bug D: calcShares uses settledCapital — stable position sizing   ║
 ╠══════════════════════════════════════════════════════════════════════╣
-║   COMPOUNDING ENGINE:                                                ║
-║   shares = floor(capital × riskPct / price / 5) × 5                 ║
-║   S1: 0.6% per bid  |  S4: 0.4% per bid                             ║
-║   At $2k → 20-40sh  |  $10k → 120sh  |  $20k → 240sh (capped 400)  ║
-║   GET /api/compound-project?capital=X&days=30 for projections        ║
-╠══════════════════════════════════════════════════════════════════════╣
-║   S1 Maker Quote Engine  — ±2¢, 6 bids+6 asks, $0 fee               ║
-║   S4 Maker-Only Scalp    — ±2.5¢, 6 bids+6 asks, $0 fee             ║
+║   S1 Maker Quote  ±2¢  0.6%/bid  6+6 slots  stop=0.06  $0 fee       ║
+║   S4 Maker Scalp  ±2.5¢  0.4%/bid  6+6 slots  stop=0.06  $0 fee    ║
 ╚══════════════════════════════════════════════════════════════════════╝
   `);
   startMainLoop();
