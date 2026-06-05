@@ -1,22 +1,19 @@
 {
-  "name": "polymarket-ladder-bot",
-  "version": "3.0.0",
-  "description": "Polymarket BTC/ETH 5-minute ladder trading bot",
+  "name": "apex-mm-bot",
+  "version": "1.0.0",
+  "description": "BTC 15-minute Polymarket market maker bot with rebate tracking",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "axios": "^1.6.0",
-    "ws": "^8.14.2",
-    "dotenv": "^16.3.1",
+    "axios": "^1.6.7",
     "cors": "^2.8.5",
-    "uuid": "^9.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.0.2"
+    "dotenv": "^16.4.5",
+    "express": "^4.18.3",
+    "uuid": "^9.0.1",
+    "ws": "^8.16.0"
   },
   "engines": {
     "node": ">=18.0.0"
