@@ -576,7 +576,7 @@ canvas { display: block; }
     <div class="logo-mark">P</div>
     <div>
       <div class="logo-text">POLYMARKET MM BOT</div>
-      <div class="logo-sub">BTC · ETH · SOL  ·  15-MIN BINARY  ·  DEMO $2,000  ·  <span style="color:var(--green-bright)">v1.1</span></div>
+      <div class="logo-sub">BTC · ETH · SOL  ·  15-MIN BINARY  ·  DEMO $2,000  ·  <span style="color:var(--green-bright)">v1.2</span></div>
     </div>
   </div>
 
@@ -731,6 +731,7 @@ canvas { display: block; }
       <div class="book-tabs">
         <div class="book-tab active" onclick="switchTab('bids',this)">OPEN BIDS</div>
         <div class="book-tab" onclick="switchTab('asks',this)">OPEN ASKS</div>
+        <div class="book-tab" onclick="switchTab('depth',this)">BOOK DEPTH</div>
         <div class="book-tab" onclick="switchTab('fills',this)">FILL LOG</div>
       </div>
       <div id="tab-bids" class="tab-panel" style="overflow:auto;max-height:310px">
@@ -744,6 +745,9 @@ canvas { display: block; }
           <thead><tr><th>ASSET</th><th>ENG</th><th>BUY $</th><th>ASK $</th><th>SHARES</th><th>UNRLZ</th><th>TICKS</th></tr></thead>
           <tbody id="asks-tbody"></tbody>
         </table>
+      </div>
+      <div id="tab-depth" class="tab-panel" style="display:none;overflow:auto;max-height:310px;padding:8px 0">
+        <div id="depth-content" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:0 10px"></div>
       </div>
       <div id="tab-fills" class="tab-panel" style="display:none;overflow:auto;max-height:310px">
         <table class="book-table">
@@ -951,6 +955,7 @@ function render(s) {
   updateChart(s);
 
   // Tables
+  renderDepth(s);
   renderBookTables(s);
 
   // Trade log
@@ -985,23 +990,27 @@ function renderAssetCards(s) {
       SCANNING: '<span class="asset-status-badge badge-scanning">SCANNING</span>',
     }[w.status] || '<span class="asset-status-badge badge-scanning">–</span>';
 
-    const score = (w.rewardScore ?? 0);
+    const score    = (w.rewardScore ?? 0);
     const scorePct = Math.round(score * 100);
 
-    const spotStr = a === 'btc'
-      ? `$${(w.spotPrice||65000).toLocaleString()}`
-      : a === 'eth'
-        ? `$${(w.spotPrice||3200).toLocaleString()}`
-        : `$${(w.spotPrice||155).toFixed(1)}`;
+    const bidStr   = w.bestBid  != null ? `B:${w.bestBid.toFixed(3)}`  : 'B:–';
+    const askStr   = w.bestAsk  != null ? `A:${w.bestAsk.toFixed(3)}`  : 'A:–';
+    const spreadStr = w.spread  != null ? `${(w.spread*100).toFixed(1)}¢` : '–';
 
     html += `
     <div class="asset-card ${w.status === 'EXPIRING' ? 'expiring' : 'active'}">
       <div class="asset-header">
         <div style="display:flex;align-items:center;gap:6px">
           <span class="asset-name">${ICONS[a]} ${NAMES[a]}</span>
-          <span class="asset-spot">${spotStr}</span>
+          <span style="font-family:'Space Mono',monospace;font-size:9px;color:var(--text-dim)">${spreadStr} spread</span>
         </div>
         ${statusBadge}
+      </div>
+
+      <div style="display:flex;justify-content:space-between;font-family:'Space Mono',monospace;font-size:10px;margin-bottom:4px">
+        <span style="color:var(--green-bright)">${bidStr}</span>
+        <span style="color:var(--cyan)">MID ${(w.upPrice??0.5).toFixed(3)}</span>
+        <span style="color:var(--red-bright)">${askStr}</span>
       </div>
 
       <div class="prob-bar-wrap">
@@ -1052,6 +1061,45 @@ function updateChart(s) {
   equityChart.data.datasets[0].backgroundColor  = bg;
 
   equityChart.update('none');
+}
+
+function renderDepth(s) {
+  let html = '';
+  CONFIG_LOCAL.assets.forEach(a => {
+    const w = s.windows[a];
+    if (!w) return;
+    const bids = w.bidDepth || [];
+    const asks = w.askDepth || [];
+    const mid  = w.upPrice;
+
+    let rows = '';
+    // Show up to 5 ask levels (descending) then mid then 5 bid levels
+    const askRows = [...asks].reverse();
+    askRows.forEach(lv => {
+      rows += `<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:9px;font-family:'Space Mono',monospace">
+        <span style="color:var(--text-dim)">${lv.s.toFixed(0)}</span>
+        <span style="color:var(--red-bright)">${lv.p.toFixed(3)}</span>
+      </div>`;
+    });
+    if (mid != null) {
+      rows += `<div style="display:flex;justify-content:center;padding:3px 0;font-size:9px;font-family:'Space Mono',monospace;color:var(--cyan);border-top:1px solid var(--border);border-bottom:1px solid var(--border);margin:2px 0">
+        MID ${mid.toFixed(3)}
+      </div>`;
+    }
+    bids.forEach(lv => {
+      rows += `<div style="display:flex;justify-content:space-between;padding:2px 0;font-size:9px;font-family:'Space Mono',monospace">
+        <span style="color:var(--green-bright)">${lv.p.toFixed(3)}</span>
+        <span style="color:var(--text-dim)">${lv.s.toFixed(0)}</span>
+      </div>`;
+    });
+
+    const spreadStr = w.spread != null ? `${(w.spread*100).toFixed(1)}¢` : '–';
+    html += `<div style="background:var(--bg-row);border:1px solid var(--border);border-radius:6px;padding:8px">
+      <div style="font-family:'Space Mono',monospace;font-size:10px;color:var(--cyan);font-weight:700;margin-bottom:4px">${a.toUpperCase()} <span style="color:var(--text-dim);font-size:9px">spread ${spreadStr}</span></div>
+      ${rows || '<div style="color:var(--text-dim);font-size:9px;text-align:center;padding:8px">Fetching...</div>'}
+    </div>`;
+  });
+  document.getElementById('depth-content').innerHTML = html;
 }
 
 function renderBookTables(s) {
