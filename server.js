@@ -294,21 +294,94 @@ function secondsIntoWindow() { return Math.floor(Date.now() / 1000) - currentWin
 function secondsLeft()       { return CONFIG.WINDOW_SEC - secondsIntoWindow(); }
 function makeSlug(asset, ts) { return `${asset}-updown-15m-${ts}`; }
 
-// ─── DEMO PRICE ENGINE ────────────────────────────────────────────────────────
-// Simulates realistic BTC 15m binary price movement
+// ─── REAL PRICE ENGINE ────────────────────────────────────────────────────────
+// Fetches live UP/DOWN token prices from Polymarket public APIs (no auth needed).
+//
+// Flow per asset:
+//   1. Compute deterministic slug  →  btc-updown-15m-{windowTs}
+//   2. GET gamma-api.polymarket.com/markets?slug=...  →  extract clobTokenIds[0/1]
+//   3. GET clob.polymarket.com/midpoint?token_id=...  →  live mid price
+//   4. Cache token IDs per window so step 2 only runs once per 15m period
+//   5. On any failure: fall back to simPriceTick so the bot never stalls
 
-function updateDemoPrices() {
-  const secsLeft = secondsLeft();
-  CONFIG.ASSETS.forEach(asset => {
-    const prev = state.prices[asset]?.up ?? 0.50;
-    const next = simPriceTick(prev, secsLeft);
-    state.prices[asset] = { up: next, down: parseFloat((1 - next).toFixed(4)), live: true };
-    // Sim spot prices with correlated moves (BTC leads)
-    const spotPrev = state.spotPrices[asset];
-    if (asset === 'btc')  state.spotPrices.btc = simBtcSpot(spotPrev);
-    if (asset === 'eth')  state.spotPrices.eth = simBtcSpot(spotPrev);
-    if (asset === 'sol')  state.spotPrices.sol = simBtcSpot(spotPrev);
-  });
+// token ID cache:  asset → { windowTs, upTokenId, downTokenId }
+const _tokenCache = {};
+
+async function fetchTokenIds(asset, windowTs) {
+  const cached = _tokenCache[asset];
+  if (cached && cached.windowTs === windowTs) {
+    return { upTokenId: cached.upTokenId, downTokenId: cached.downTokenId };
+  }
+
+  const slug = makeSlug(asset, windowTs);
+  const url  = `https://gamma-api.polymarket.com/markets?slug=${slug}`;
+
+  const res  = await axios.get(url, { timeout: 4000 });
+  const markets = res.data;
+
+  if (!Array.isArray(markets) || markets.length === 0) {
+    throw new Error(`No market found for slug: ${slug}`);
+  }
+
+  const market = markets[0];
+  const ids    = market.clobTokenIds || market.clob_token_ids;
+  if (!ids || ids.length < 2) throw new Error(`Missing clobTokenIds for ${slug}`);
+
+  // Index 0 = UP (Yes), index 1 = DOWN (No) — consistent with Polymarket ordering
+  const upTokenId   = ids[0];
+  const downTokenId = ids[1];
+
+  _tokenCache[asset] = { windowTs, upTokenId, downTokenId };
+  log('info', `🔗 TOKEN IDs cached ${asset.toUpperCase()} | UP=${upTokenId.slice(0,12)}… DOWN=${downTokenId.slice(0,12)}…`);
+
+  return { upTokenId, downTokenId };
+}
+
+async function fetchMidPrice(tokenId) {
+  const url = `https://clob.polymarket.com/midpoint?token_id=${tokenId}`;
+  const res = await axios.get(url, { timeout: 3000 });
+  const mid = parseFloat(res.data?.mid ?? res.data?.midpoint ?? res.data?.price);
+  if (isNaN(mid)) throw new Error(`Bad midpoint response for token ${tokenId.slice(0,12)}`);
+  return clamp(mid, 0.01, 0.99);
+}
+
+// Spot prices: CoinGecko simple price endpoint — completely free, no API key
+// Batched in a single call. Runs on a slower cadence (every 6 ticks ≈ 15s).
+const COINGECKO_IDS = { btc: 'bitcoin', eth: 'ethereum', sol: 'solana' };
+let _spotFetchTick  = 0;
+
+async function fetchSpotPrices() {
+  const ids = Object.values(COINGECKO_IDS).join(',');
+  const url = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`;
+  const res = await axios.get(url, { timeout: 5000 });
+  const d   = res.data;
+  if (d?.bitcoin?.usd)  state.spotPrices.btc = d.bitcoin.usd;
+  if (d?.ethereum?.usd) state.spotPrices.eth = d.ethereum.usd;
+  if (d?.solana?.usd)   state.spotPrices.sol = d.solana.usd;
+}
+
+async function updateRealPrices() {
+  const wTs = currentWindowTs();
+
+  // Fetch all three assets concurrently — any failure throws and halts the tick
+  await Promise.all(CONFIG.ASSETS.map(async (asset) => {
+    const { upTokenId, downTokenId } = await fetchTokenIds(asset, wTs);
+
+    const [upMid, downMid] = await Promise.all([
+      fetchMidPrice(upTokenId),
+      fetchMidPrice(downTokenId),
+    ]);
+
+    state.prices[asset] = { up: upMid, down: downMid, live: true };
+  }));
+
+  // Fetch spot prices on a slower cadence (every 6 ticks ≈ 15s) to respect CoinGecko rate limits
+  _spotFetchTick++;
+  if (_spotFetchTick % 6 === 1) {
+    fetchSpotPrices().catch(err =>
+      log('warn', `⚠️ Spot price fetch failed | ${err.message}`)
+    );
+  }
 }
 
 // ─── ORDER SIMULATION ────────────────────────────────────────────────────────
@@ -674,7 +747,7 @@ function resetWindowIfNeeded(asset) {
 
 async function tick() {
   globalTick++;
-  updateDemoPrices();
+  await updateRealPrices();
 
   for (const asset of CONFIG.ASSETS) {
     resetWindowIfNeeded(asset);
