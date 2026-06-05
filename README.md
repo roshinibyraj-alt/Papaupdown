@@ -1,134 +1,156 @@
-# APEX MM v1.0 — BTC 15-Minute Polymarket Market Maker
+# 📊 Polymarket Market Maker Bot — DEMO MODE
 
-## What This Bot Does
+A simulated two-sided market making bot for **Polymarket BTC/ETH/SOL 15-minute binary windows**, with a live real-time dashboard.
 
-Posts maker limit orders on **BTC UP/DOWN 15-minute binary windows** on Polymarket.
+---
 
-- **Zero maker fees** — Polymarket charges $0 to liquidity providers
-- **Earns 20% rebate** of all taker fees daily in PUSD (crypto category)
-- **Two strategies running in parallel:**
-  - **S1 WIDE** — ±3¢ spread, 0.7% capital per bid, stops 45s before close
-  - **S2 TIGHT** — ±1.5¢ spread (reward farming zone), 0.4% capital per bid
-- **Compounding capital** — position sizes grow automatically as capital grows
-- **Velocity freeze** — pauses new quotes when price moves >4¢ in one tick
-- **Emergency close** — all open positions exit as takers with <12s left
+## 🧠 Strategy Overview
 
-## Deployment: GitHub + Railway (Step-by-Step)
+### How It Makes Money
 
-### Step 1 — Create GitHub Repository
+The bot runs **two maker quote engines simultaneously** on 3 assets:
 
-1. Go to **github.com** → sign in
-2. Click **"New"** (green button, top left)
-3. Name it: `apex-mm-bot`
-4. Set to **Private**
-5. Click **"Create repository"**
-6. On the next screen, click **"uploading an existing file"**
-7. Upload ALL files (keep the folder structure):
-   - `server.js`
-   - `package.json`
-   - `.env.example`
-   - `public/index.html`
-8. Click **"Commit changes"**
+| Engine | Half-Spread | Full Spread | Per 100sh Round-Trip | Fees |
+|--------|-------------|-------------|----------------------|------|
+| Maker  | ±2¢         | 4¢          | **$4.00**            | $0   |
+| Scalp  | ±1.5¢       | 3¢          | **$3.00**            | $0   |
 
-### Step 2 — Deploy on Railway
+**Edge sources (3 stacked):**
+1. **Spread capture** — Buy the bid, sell the ask, pocket the difference. Zero taker fees as a maker.
+2. **Liquidity Rewards** — Polymarket pays daily USDC to orders resting near the midpoint. Scoring is **quadratic**: twice as close = 4× the score.
+3. **Maker Rebates** — ~20% of the taker fee on every fill returned to makers. Funded by taker volume.
 
-1. Go to **railway.app** → sign in with GitHub
-2. Click **"New Project"** → **"Deploy from GitHub repo"**
-3. Select your `apex-mm-bot` repository
-4. Railway will auto-detect Node.js and deploy
+### Risk Management
+- Max **35% of capital** in open positions at once
+- **Adverse selection guard**: if mid moves >7¢ against open quotes, scalp engine pauses
+- **Emergency flatten** at T-12 seconds: all open asks sold at market (taker) before expiry
+- **Cooldown system**: 3 ticks (7.5s) before reposting at the same price level
+- **Requote on drift**: cancel stale quotes if mid has moved >1.5¢
 
-### Step 3 — Set Environment Variables on Railway
+### Position Sizing (Compounding)
+```
+shares = floor(capital × 0.5% / price / 5) × 5
+```
+At $2,000 → ~20 shares/bid.  
+At $4,000 → ~40 shares/bid.  
+Returns stay constant % as capital grows.
 
-Click your project → **"Variables"** tab → add these:
+---
 
-| Variable | Value |
-|----------|-------|
-| `DEMO_MODE` | `true` (change to `false` for live trading) |
-| `DEMO_CAPITAL` | `2000` |
-| `PORT` | `3000` |
-| `S1_RISK` | `0.007` |
-| `S2_RISK` | `0.004` |
+## 🚀 Quick Start
 
-For live trading, also add:
+### 1. Run Locally
 
-| Variable | Value |
-|----------|-------|
-| `POLYMARKET_API_KEY` | Your Polymarket API key |
+```bash
+# Clone or create the project folder
+cd polymarket-mm-bot
 
-### Step 4 — Access Your Dashboard
+# Install dependencies
+npm install
 
-Railway gives you a URL like `https://apex-mm-bot-production.up.railway.app`
+# Copy env file
+cp .env.example .env
 
-Open it in your browser or phone. The dashboard updates in real-time.
+# Start (demo mode by default)
+npm start
 
-## Understanding the Dashboard
+# Open dashboard
+open http://localhost:3000
+```
 
-### Capital Hero
-Shows your total capital, total PnL, win/loss rate, and rebate earned.
+### 2. Deploy to Railway
 
-### Window Timer
-A progress bar showing how much time is left in the current 15-minute window.
-Goes **red** when less than 60 seconds remain.
+1. Push this folder to a **GitHub repository**
+2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
+3. Select your repo
+4. Railway auto-detects Node.js and runs `node server.js`
+5. Add environment variables in Railway dashboard (Settings → Variables):
+   ```
+   DEMO_MODE=true
+   DEMO_CAPITAL=2000
+   PORT=3000
+   ```
+6. Click **Deploy** → your bot is live with a public URL
 
-### Live Prices
-UP and DOWN prices in real-time, updated every 2.5 seconds.
+> Railway free tier: 500 hours/month. Upgrade to Hobby ($5/mo) for 24/7.
 
-### S1 WIDE / S2 TIGHT Cards
-- **Open Bids** — number of resting limit orders waiting to be filled
-- **Open Shares** — shares in filled bids waiting for their take-profit exit
-- **Trades** — completed round-trips this window
-- **Size** — current position size based on compounded capital
+---
 
-### Rebate Tracker
-Estimated PUSD rebates accruing daily. This is paid by Polymarket separately
-from your trading PnL — free money for providing liquidity.
+## 📈 Dashboard Features
 
-### Capital Curve
-Chart of capital growth across all completed windows.
+| Panel | What It Shows |
+|-------|---------------|
+| **KPI Row** | Total P&L, round-trips, liquidity rewards, maker rebates, fees, exposure, session time, net edge |
+| **Window Timer** | Countdown to expiry — turns red at <60s |
+| **Asset Cards** | BTC/ETH/SOL: binary probability bar, open orders, reward score, per-window P&L |
+| **Equity Curve** | Real-time chart of $2,000 capital, auto-colors green/red |
+| **Open Bids** | All resting bids with reward score per quote |
+| **Open Asks** | Exit leg orders with unrealized P&L |
+| **Fill Log** | Every trade with price, shares, P&L |
+| **Trade Stream** | Live feed of BUY/SELL events |
+| **System Log** | Engine events, warnings, reward drips |
+| **Window History** | P&L and round-trips per completed 15m window |
+| **Config Panel** | Adjust spreads and exposure live |
 
-### 30-Day Projection
-Appears after 2+ windows. Shows compound growth at current pace.
-(Projection is illustrative — actual results will vary)
+---
 
-### Fee & Rebate Matrix
-Shows taker fee per 100 shares at each price level, the 20% rebate you earn,
-and the minimum price move needed to break even on a stop-loss.
+## ⚙️ Configuration
 
-## How the Edge Works
-
-**Market making earns money in two ways:**
-
-1. **Spread income** — when price oscillates in our range, we fill bids and
-   ask exits capture the spread: 6¢ (S1) or 3¢ (S2) per round-trip, zero fees.
-
-2. **Rebate income** — 20% of taker fees flow back to us daily. Even if spread
-   income is zero, rebates alone make maker orders profitable at Polymarket.
-
-**What risks us:**
-
-- **Adverse selection** — if BTC news breaks and price gaps 10¢+ immediately,
-  takers informed before us fill our bids at stale prices. Stop-loss exits
-  at 7¢ (S1) or 5¢ (S2) below entry price cap the damage.
-- **Near-resolution risk** — we stop posting new bids 45s/90s before window
-  close to avoid holding inventory through the binary resolution.
-
-## Going Live
-
-1. Get your Polymarket API key from account settings
-2. Change `DEMO_MODE` to `false` on Railway
-3. Add `POLYMARKET_API_KEY` to Railway variables
-4. The bot uses the same code — no other changes needed
-
-**Recommended:** Run in demo mode for at least 1-2 days first to understand
-the typical PnL pattern before switching to live.
-
-## Environment Variables Reference
+Edit `.env` or use the dashboard Config panel:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DEMO_MODE` | `true` | Set `false` for live trading |
-| `DEMO_CAPITAL` | `2000` | Starting capital in demo mode |
-| `POLYMARKET_API_KEY` | — | Required for live trading |
-| `PORT` | `3000` | Server port (Railway sets this automatically) |
-| `S1_RISK` | `0.007` | S1 risk fraction per bid (0.7%) |
-| `S2_RISK` | `0.004` | S2 risk fraction per bid (0.4%) |
+| `DEMO_MODE` | `true` | Set `false` for live (requires credentials) |
+| `DEMO_CAPITAL` | `2000` | Starting capital in USD |
+| `PORT` | `3000` | Server port |
+| `ASSETS` | `btc,eth,sol` | Which assets to quote |
+
+---
+
+## 🔬 Reward System (Demo Simulation)
+
+### Liquidity Rewards
+- Polymarket samples the order book **every minute**
+- Score formula: `S = (1 - spread/maxSpread)²`
+- At ±1.5¢ spread, score ≈ **0.91** (near-perfect)
+- At ±3¢ spread, score ≈ **0.64**
+- Daily payout ∝ your score share of total market pool
+
+### Maker Rebates
+- Formula: `rebate = taker_fee × 0.20`
+- Taker fee: `0.07 × shares × p × (1-p)` 
+- At p=0.50, 100 shares: fee = $1.75 → your rebate = **$0.35**
+- Paid daily in USDC, min $1 threshold
+
+---
+
+## 🗂️ File Structure
+
+```
+polymarket-mm-bot/
+├── server.js          ← Bot engine + WebSocket + REST API
+├── public/
+│   └── index.html     ← Dashboard (self-contained)
+├── package.json
+├── railway.json       ← Railway deploy config
+├── .env.example
+└── .gitignore
+```
+
+---
+
+## 🔒 Going Live (When Ready)
+
+When switching `DEMO_MODE=false`, you'll need:
+1. A Polymarket account + Polygon wallet
+2. `POLYMARKET_API_KEY` from app.polymarket.com → Settings → API
+3. `POLYGON_PRIVATE_KEY` (your wallet key — keep secret)
+4. `POLYGON_RPC_URL` (e.g. `https://polygon-rpc.com`)
+
+The bot will use the real CLOB API: POST `/order` with limit orders, signed via your private key.
+
+---
+
+## ⚠️ Disclaimer
+
+This is a **demo simulation** only. All fills, prices, and rewards are simulated. Real trading involves execution risk, adverse selection, oracle delays, and market risk. Past simulated performance does not predict real results.
