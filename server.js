@@ -72,23 +72,6 @@ function estimateDailyReward(postedSizeUSD, score) {
   return postedSizeUSD / 1000 * 0.20 * score;
 }
 
-// ─── SIMULATION HELPERS ───────────────────────────────────────────────────────
-function gaussianRandom(mean = 0, std = 1) {
-  const u1 = Math.random(), u2 = Math.random();
-  return mean + std * Math.sqrt(-2 * Math.log(Math.max(u1, 1e-10))) * Math.cos(2 * Math.PI * u2);
-}
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-
-function simPriceTick(prev, windowSecsLeft) {
-  const volScale = windowSecsLeft < 60 ? 2.5 : windowSecsLeft < 180 ? 1.5 : 1.0;
-  const drift    = 0.003 * gaussianRandom(0, 1) * volScale;
-  const meanRev  = 0.04 * (0.50 - prev);
-  return parseFloat(clamp(prev + drift + meanRev, 0.02, 0.98).toFixed(4));
-}
-function simSpot(prev, volatility = 0.0008) {
-  return parseFloat((prev * (1 + gaussianRandom(0, volatility))).toFixed(0));
-}
-
 // FIX 1: Higher ask fill base rate (0.55 vs 0.35) so exits match entries
 function simBidFillProb(limitPrice, currentMid, queuePos) {
   if (limitPrice >= currentMid) return 0;
@@ -236,16 +219,114 @@ function secondsIntoWindow() { return Math.floor(Date.now()/1000) - currentWindo
 function secondsLeft()       { return CONFIG.WINDOW_SEC - secondsIntoWindow(); }
 function makeSlug(a, ts)     { return `${a}-updown-15m-${ts}`; }
 
-// ─── PRICE SIMULATION ────────────────────────────────────────────────────────
-function updateDemoPrices() {
-  const secsLeft = secondsLeft();
-  CONFIG.ASSETS.forEach(a => {
-    const prev = state.prices[a]?.up ?? 0.50;
-    const next = simPriceTick(prev, secsLeft);
-    state.prices[a] = { up: next, down: parseFloat((1 - next).toFixed(4)) };
-    state.spotPrices[a] = simSpot(state.spotPrices[a],
-      a === 'btc' ? 0.0008 : a === 'eth' ? 0.001 : 0.0012);
-  });
+// ─── REAL POLYMARKET PRICE ENGINE ────────────────────────────────────────────
+// Step 1: Build deterministic slug from timestamp — no API polling needed
+//   btc-updown-15m-{windowTs}, eth-updown-15m-{windowTs}, sol-updown-15m-{windowTs}
+// Step 2: Gamma API → get conditionId + clobTokenIds (YES tokenId, NO tokenId)
+// Step 3: CLOB API /book?token_id=... → real best bid/ask → compute mid
+// Zero auth required for all read endpoints.
+
+const GAMMA_API = 'https://gamma-api.polymarket.com';
+const CLOB_API  = 'https://clob.polymarket.com';
+const SLUG_PREFIX = { btc: 'btc-updown', eth: 'eth-updown', sol: 'sol-updown' };
+
+// Cache token IDs per window so we don't re-fetch every 2.5s tick
+// key: "${asset}-${windowTs}" → { yesTokenId, noTokenId, conditionId, fetched }
+const tokenIdCache = {};
+
+function buildSlug(asset, windowTs) {
+  return `${SLUG_PREFIX[asset]}-15m-${windowTs}`;
+}
+
+async function fetchTokenIds(asset, windowTs) {
+  const cacheKey = `${asset}-${windowTs}`;
+  if (tokenIdCache[cacheKey]?.fetched) return tokenIdCache[cacheKey];
+
+  const slug = buildSlug(asset, windowTs);
+  try {
+    const res    = await axios.get(`${GAMMA_API}/events`, {
+      params: { slug }, timeout: 5000,
+    });
+    const events = Array.isArray(res.data) ? res.data : (res.data.events || [res.data]);
+    const event  = events.find(e =>
+      e.slug === slug || (e.markets && e.markets.length > 0)
+    );
+    if (!event) { log('warn', `🔍 Not indexed yet: ${slug}`); return null; }
+
+    const market    = event.markets ? event.markets[0] : event;
+    const rawTokens = market.clobTokenIds;
+    const tokenIds  = typeof rawTokens === 'string' ? JSON.parse(rawTokens) : rawTokens;
+
+    const result = {
+      yesTokenId:  tokenIds[0],
+      noTokenId:   tokenIds[1],
+      conditionId: market.conditionId || market.condition_id || event.conditionId,
+      slug,
+      fetched: true,
+    };
+    tokenIdCache[cacheKey] = result;
+    log('info', `✅ MARKET ${asset.toUpperCase()} | slug=${slug} | yesToken=${result.yesTokenId?.slice(0,14)}...`);
+    return result;
+  } catch (err) {
+    log('warn', `⚠️  Gamma error ${asset}: ${err.message}`);
+    return null;
+  }
+}
+
+async function fetchOrderBook(tokenId) {
+  try {
+    const res = await axios.get(`${CLOB_API}/book`, {
+      params: { token_id: tokenId }, timeout: 4000,
+    });
+    return res.data;
+  } catch { return null; }
+}
+
+function extractMid(book) {
+  if (!book) return null;
+  const bestBid = book.bids?.length  ? parseFloat(book.bids[0].price)  : null;
+  const bestAsk = book.asks?.length  ? parseFloat(book.asks[0].price)  : null;
+  if (bestBid !== null && bestAsk !== null) return parseFloat(((bestBid + bestAsk) / 2).toFixed(4));
+  if (book.last_trade_price)               return parseFloat(book.last_trade_price);
+  return null;
+}
+
+// Called every tick — fetches real live prices for all assets in parallel
+async function updateRealPrices() {
+  const windowTs = currentWindowTs();
+  await Promise.all(CONFIG.ASSETS.map(async (asset) => {
+    let tokens = tokenIdCache[`${asset}-${windowTs}`];
+    if (!tokens?.fetched) tokens = await fetchTokenIds(asset, windowTs);
+    if (!tokens) { state.windows[asset].status = 'SCANNING'; return; }
+
+    const book = await fetchOrderBook(tokens.yesTokenId);
+    if (!book)  return;
+
+    const mid = extractMid(book);
+    if (mid === null || mid <= 0 || mid >= 1) return;
+
+    const prevUp = state.prices[asset]?.up ?? mid;
+    state.prices[asset] = {
+      up:        mid,
+      down:      parseFloat((1 - mid).toFixed(4)),
+      bestBid:   book.bids?.[0] ? parseFloat(book.bids[0].price) : null,
+      bestAsk:   book.asks?.[0] ? parseFloat(book.asks[0].price) : null,
+      lastTrade: book.last_trade_price ? parseFloat(book.last_trade_price) : null,
+      bidDepth:  (book.bids || []).slice(0, 5).map(b => ({ p: parseFloat(b.price), s: parseFloat(b.size) })),
+      askDepth:  (book.asks || []).slice(0, 5).map(a => ({ p: parseFloat(a.price), s: parseFloat(a.size) })),
+      tickSize:  parseFloat(book.tick_size || '0.01'),
+      live:      true,
+      tokenId:   tokens.yesTokenId,
+      conditionId: tokens.conditionId,
+      slug:      tokens.slug,
+    };
+    state.windows[asset].slug        = tokens.slug;
+    state.windows[asset].conditionId = tokens.conditionId;
+    state.windows[asset].tokenId     = tokens.yesTokenId;
+
+    const move = Math.abs(mid - prevUp);
+    if (move > 0.03) log('info', `📈 ${asset.toUpperCase()} ${prevUp.toFixed(3)} → ${mid.toFixed(3)} (${(move*100).toFixed(1)}¢ move)`);
+  }));
 }
 
 // ─── EXECUTION ───────────────────────────────────────────────────────────────
@@ -544,7 +625,7 @@ function resetWindowIfNeeded(asset) {
 // ─── MAIN TICK ───────────────────────────────────────────────────────────────
 async function tick() {
   globalTick++;
-  updateDemoPrices();
+  await updateRealPrices();
   for (const asset of CONFIG.ASSETS) {
     resetWindowIfNeeded(asset);
     await processWindow(asset);
@@ -570,9 +651,17 @@ function getPublicState() {
       status:          win.status,
       secsLeft:        win.secsLeft,
       slug:            win.slug,
-      upPrice:         p?.up   ?? null,
-      downPrice:       p?.down ?? null,
-      spotPrice:       state.spotPrices[a],
+      upPrice:         p?.up        ?? null,
+      downPrice:       p?.down      ?? null,
+      bestBid:         p?.bestBid   ?? null,
+      bestAsk:         p?.bestAsk   ?? null,
+      lastTrade:       p?.lastTrade ?? null,
+      spread:          (p?.bestBid && p?.bestAsk) ? parseFloat((p.bestAsk - p.bestBid).toFixed(4)) : null,
+      bidDepth:        p?.bidDepth  ?? [],
+      askDepth:        p?.askDepth  ?? [],
+      tickSize:        p?.tickSize  ?? 0.01,
+      tokenId:         p?.tokenId   ?? null,
+      conditionId:     p?.conditionId ?? null,
       realizedPnl:     win.realizedPnl,
       unrealizedPnl:   win.unrealizedPnl,
       feePaid:         win.feePaid,
@@ -600,7 +689,7 @@ function getPublicState() {
 
   return {
     mode:               'DEMO',
-    version:            '1.1',
+    version:            '1.2',
     capital:            parseFloat(state.capital.toFixed(2)),
     startCapital:       state.startCapital,
     totalPnl:           parseFloat(totalPnl.toFixed(2)),
