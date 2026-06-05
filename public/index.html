@@ -576,7 +576,7 @@ canvas { display: block; }
     <div class="logo-mark">P</div>
     <div>
       <div class="logo-text">POLYMARKET MM BOT</div>
-      <div class="logo-sub">BTC · ETH · SOL  ·  15-MIN BINARY  ·  DEMO $2,000</div>
+      <div class="logo-sub">BTC · ETH · SOL  ·  15-MIN BINARY  ·  DEMO $2,000  ·  <span style="color:var(--green-bright)">v1.1</span></div>
     </div>
   </div>
 
@@ -621,10 +621,10 @@ canvas { display: block; }
       <div class="kpi-value purple" id="kpi-rebates">$0.0000</div>
       <div class="kpi-sub">~20% taker fee</div>
     </div>
-    <div class="kpi-card">
-      <div class="kpi-label">Fees Paid</div>
-      <div class="kpi-value cyan" id="kpi-fees">$0.0000</div>
-      <div class="kpi-sub">emergency exits</div>
+    <div class="kpi-card red">
+      <div class="kpi-label">Timeout Exits</div>
+      <div class="kpi-value" id="kpi-timeouts">0</div>
+      <div class="kpi-sub" id="kpi-fees-sub">fees $0.0000</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label">Open Exposure</div>
@@ -685,9 +685,10 @@ canvas { display: block; }
           <input class="ctrl-input" id="cfg-exposure" type="number" step="0.05" min="0.1" max="0.8" value="0.35">
         </div>
         <div class="ctrl-group">
-          <div class="ctrl-label" style="visibility:hidden">x</div>
-          <button class="btn-apply" onclick="applyConfig()">▶ APPLY CONFIG</button>
+          <div class="ctrl-label">ASK TIMEOUT (ticks)</div>
+          <input class="ctrl-input" id="cfg-ask-timeout" type="number" step="1" min="4" max="40" value="12">
         </div>
+        <button class="btn-apply" style="grid-column:1/-1" onclick="applyConfig()">▶ APPLY CONFIG</button>
       </div>
     </div>
 
@@ -740,7 +741,7 @@ canvas { display: block; }
       </div>
       <div id="tab-asks" class="tab-panel" style="display:none;overflow:auto;max-height:310px">
         <table class="book-table">
-          <thead><tr><th>ASSET</th><th>SIDE</th><th>BUY $</th><th>ASK $</th><th>SHARES</th><th>UNRLZ</th></tr></thead>
+          <thead><tr><th>ASSET</th><th>ENG</th><th>BUY $</th><th>ASK $</th><th>SHARES</th><th>UNRLZ</th><th>TICKS</th></tr></thead>
           <tbody id="asks-tbody"></tbody>
         </table>
       </div>
@@ -898,7 +899,8 @@ function render(s) {
   document.getElementById('kpi-rt').textContent  = s.totalRoundTrips.toLocaleString();
   document.getElementById('kpi-rewards').textContent = `$${s.totalRewardsEarned.toFixed(4)}`;
   document.getElementById('kpi-rebates').textContent = `$${s.totalMakerRebates.toFixed(4)}`;
-  document.getElementById('kpi-fees').textContent    = `$${s.totalFeesPaid.toFixed(4)}`;
+  document.getElementById('kpi-timeouts').textContent = s.totalTimeoutExits ?? 0;
+  document.getElementById('kpi-fees-sub').textContent = `fees $${s.totalFeesPaid.toFixed(4)}`;
   document.getElementById('kpi-exposure').textContent = `$${s.openExposure.toFixed(2)}`;
   document.getElementById('kpi-exposure-pct').textContent =
     `${(s.openExposure / s.capital * 100).toFixed(1)}% of capital`;
@@ -1072,25 +1074,30 @@ function renderBookTables(s) {
   });
   document.getElementById('bids-tbody').innerHTML = bidsHtml || '<tr><td colspan="6" style="color:var(--text-dim);text-align:center;padding:14px">No open bids</td></tr>';
 
-  // Asks
+  // Asks — now shows engine type + ticks open
   let asksHtml = '';
   CONFIG_LOCAL.assets.forEach(a => {
     const w = s.windows[a];
     if (!w) return;
     (w.openAsksDetail || []).forEach(ak => {
-      const unrlz = ak.unrealized ?? 0;
-      const cls   = unrlz >= 0 ? 'col-pnl-pos' : 'col-pnl-neg';
+      const unrlz  = ak.unrealized ?? 0;
+      const cls    = unrlz >= 0 ? 'col-pnl-pos' : 'col-pnl-neg';
+      const engCls = ak.type === 'MAKER' ? 'col-type-maker' : 'col-type-scalp';
+      const ticksOpen = ak.ticksOpen ?? 0;
+      // Warn if close to timeout
+      const timeoutWarn = ticksOpen >= 9 ? 'color:var(--red-bright);font-weight:700' : 'color:var(--text-dim)';
       asksHtml += `<tr>
         <td style="color:var(--cyan)">${a.toUpperCase()}</td>
-        <td style="color:var(--green-bright)">UP</td>
+        <td class="${engCls}">${ak.type}</td>
         <td class="col-bid">${ak.buyPrice.toFixed(4)}</td>
         <td class="col-ask">${ak.askPrice.toFixed(4)}</td>
         <td class="col-shares">${ak.shares}</td>
         <td class="${cls}">${unrlz >= 0 ? '+' : ''}$${unrlz.toFixed(3)}</td>
+        <td style="${timeoutWarn}">${ticksOpen}</td>
       </tr>`;
     });
   });
-  document.getElementById('asks-tbody').innerHTML = asksHtml || '<tr><td colspan="6" style="color:var(--text-dim);text-align:center;padding:14px">No open asks</td></tr>';
+  document.getElementById('asks-tbody').innerHTML = asksHtml || '<tr><td colspan="7" style="color:var(--text-dim);text-align:center;padding:14px">No open asks</td></tr>';
 
   // Fill log
   let fillsHtml = '';
@@ -1124,6 +1131,8 @@ function renderTradeLog(s) {
     const isBuy = t.action === 'BUY';
     const d    = new Date(t.time);
     const ts   = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}:${String(d.getSeconds()).padStart(2,'0')}`;
+    const eng  = t.engineType || (t.isMaker ? 'MAKER' : 'TAKER');
+    const engColor = eng === 'MAKER' ? 'var(--cyan-dim)' : eng === 'SCALP' ? 'var(--amber)' : 'var(--red-bright)';
     const pnlStr = t.pnl !== undefined
       ? `<div class="trade-pnl ${t.pnl >= 0 ? 'pnl-positive' : 'pnl-negative'}">${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(3)}</div>`
       : '';
@@ -1133,7 +1142,7 @@ function renderTradeLog(s) {
         <span class="trade-action ${isBuy ? 'trade-buy' : 'trade-sell'}">${t.action}</span>
         <span style="color:var(--text-dim);font-size:9px">${ts}</span>
       </div>
-      <div class="trade-detail">${(t.asset||'').toUpperCase()} · ${t.shares}sh @ $${t.price.toFixed(4)} ${t.isMaker ? '· MAKER' : '· TAKER'}</div>
+      <div class="trade-detail">${(t.asset||'').toUpperCase()} · ${t.shares}sh @ $${t.price.toFixed(4)} · <span style="color:${engColor}">${eng}</span></div>
       ${pnlStr}
     </div>`;
   });
@@ -1197,11 +1206,11 @@ async function applyConfig() {
   const makerHalf    = parseFloat(document.getElementById('cfg-maker-half').value);
   const scalpHalf    = parseFloat(document.getElementById('cfg-scalp-half').value);
   const maxExposurePct = parseFloat(document.getElementById('cfg-exposure').value);
-
+  const askTimeout   = parseInt(document.getElementById('cfg-ask-timeout').value);
   await fetch('/api/config', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ makerHalf, scalpHalf, maxExposurePct })
+    body: JSON.stringify({ makerHalf, scalpHalf, maxExposurePct, askTimeout })
   });
 }
 
