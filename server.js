@@ -1,665 +1,831 @@
 'use strict';
-require('dotenv').config();
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  POLYMARKET MARKET MAKER BOT — DEMO MODE  v2.0
+const fetch     = require('node-fetch');
+const WebSocket = require('ws');
+const fs        = require('fs');
+const path      = require('path');
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  MERGE-ARB MARKET MAKER  —  BTC 5-min binary  —  $2 000 demo
 //
-//  PRICE ENGINE: Real Polymarket APIs, zero auth required
-//  ─────────────────────────────────────────────────────────────────────────────
-//  Step 1: Slug built deterministically from timestamp
-//          btc-updown-15m-{floor(unixTs/900)*900}
+//  STRATEGY
+//  ─────────
+//  Every tick:
+//    1. Fetch best bid for UP token and DOWN token.
+//    2. Post a maker BID at (best_bid + 0.05), clamped to [BID_MIN, BID_MAX].
+//       We are top-of-book → takers fill us → we earn the maker rebate.
+//    3. A fill deducts (shares × fill_price) from balance and stores the
+//       shares in upInventory / downInventory.
+//    4. New bids are posted after each fill so we keep accumulating.
 //
-//  Step 2: GET gamma-api.polymarket.com/markets?slug=...
-//          → outcomes[] + clobTokenIds[]
-//          → map "Up"→upTokenId, "Down"→downTokenId  (exact strings from API)
+//  At T-60 s before window close (MERGE_WINDOW_SECS = 60):
+//    5. matched   = min(upInventory, downInventory)
+//       UP + DOWN = $1.00 guaranteed → credit (matched × $1.00) to balance.
+//    6. leftoverUp   = upInventory  - matched  → sell as taker
+//       leftoverDown = downInventory - matched  → sell as taker
+//       Taker sells deduct a 2 % fee on proceeds.
+//    7. All rebates already added at fill time are correct.
+//       Window P&L = merge_proceeds + taker_proceeds + rebates_this_window
+//                    – total_cost_this_window
 //
-//  Step 3: GET clob.polymarket.com/midpoint?token_id=upTokenId   → up mid
-//          GET clob.polymarket.com/midpoint?token_id=downTokenId → down mid
-//          Both are REAL live order-book prices. Called every 2.5s.
-//
-//  Step 4: GET clob.polymarket.com/book?token_id=... for full depth display
-//
-//  STRATEGY:
-//  ─────────────────────────────────────────────────────────────────────────────
-//  S1 MAKER QUOTE  ±2¢ spread, 0.6%/bid, 6+6 slots per side (UP + DOWN)
-//  S4 MAKER SCALP  ±2.5¢ spread, 0.4%/bid, 6+6 slots per side (UP + DOWN)
-//  Both sides (UP and DOWN) quoted simultaneously — captures spread on any move.
-//  Zero fees as maker. Rebate ~20% of taker fee on each bid fill.
-//  Emergency close at T-10s. Stop-loss at 6¢ below entry.
-//
-//  FEE: taker = 0.07 × shares × p × (1-p) | maker = $0.00
-// ═══════════════════════════════════════════════════════════════════════════════
+//  MATH CHECK (mid-price example: UP bid = 0.55, DOWN bid = 0.45)
+//  ────────────────────────────────────────────────────────────────
+//  UP fill:   floor(100/0.55)=181 sh, cost=$99.55, rebate=181×0.55×0.004=$0.398
+//  DOWN fill: floor(100/0.45)=222 sh, cost=$99.90, rebate=222×0.45×0.004=$0.400
+//  Match:     181 pairs → $181.00 guaranteed
+//  Leftover:  41 DOWN sh → taker sell @0.45 → proceeds=$18.45, fee=$0.369
+//  Net:       $181.00+$18.45-$0.369+$0.798 – $199.45 = +$0.429 ✓
+//  Worst case (no merge → resolution): risk = leftover cost on losing side.
+// ─────────────────────────────────────────────────────────────────────────────
 
-const express      = require('express');
-const http         = require('http');
-const WebSocket    = require('ws');
-const axios        = require('axios');
-const { v4: uuidv4 } = require('uuid');
-const EventEmitter = require('events');
-const path         = require('path');
-const cors         = require('cors');
+const GAMMA     = 'https://gamma-api.polymarket.com';
+const CLOB_REST = 'https://clob.polymarket.com';
 
-// ─── APIS ─────────────────────────────────────────────────────────────────────
-const GAMMA_URL = 'https://gamma-api.polymarket.com';
-const CLOB_URL  = 'https://clob.polymarket.com';
+const TRADES_FILE = path.join(__dirname, 'trades.json');
+const EQUITY_FILE = path.join(__dirname, 'equity.json');
 
-// ─── FEE MATH ─────────────────────────────────────────────────────────────────
-function takerFeePerShare(p) { return 0.07 * p * (1 - p); }
-function takerFee(shares, p) { return shares * takerFeePerShare(p); }
-function breakEvenMove(p)    { return (2*0.07*p*(1-p)) / (1 - 0.07*(1-2*p)); }
+const MARKET_ID   = 'btc-5m';
+const MARKET_SLUG = 'btc-updown-5m';
+const ASSET       = 'BTC';
 
-// ─── FILL SIMULATION ──────────────────────────────────────────────────────────
-// Realistic CLOB fill model from your original script
-function simMakerBidFillThisTick(currentPrice, limitPrice, queuePos) {
-  if (currentPrice > limitPrice) return false;
-  const probs = [0, 0.40, 0.20, 0.08, 0.08, 0.08];
-  return Math.random() < (probs[Math.min(queuePos, 5)] || 0.05);
-}
-function simMakerAskFillThisTick(currentPrice, limitPrice, queuePos) {
-  if (currentPrice < limitPrice) return false;
-  const probs = [0, 0.40, 0.20, 0.08, 0.08, 0.08];
-  return Math.random() < (probs[Math.min(queuePos, 5)] || 0.05);
-}
-function simPartialFill(shares, isTaker) {
-  if (isTaker || shares <= 60) return shares;
-  return Math.round(shares * (0.60 + Math.random()*0.40) / 5) * 5;
-}
-function poissonRandom(lambda) {
-  const L = Math.exp(-lambda);
-  let k = 0, p = 1;
-  do { k++; p *= Math.random(); } while (p > L);
-  return k - 1;
-}
-function simTakerFillPrice(mid, isBuy) {
-  const ticks = poissonRandom(0.6);
-  return isBuy ? mid + ticks*0.005 : mid - ticks*0.005;
-}
+const WINDOW_SIZE        = 300;   // 5 minutes
+const MERGE_WINDOW_SECS  = 60;    // start merge at T-60 s
+const BID_OFFSET         = 0.05;  // post bid this much ABOVE current best bid
+const BID_MIN            = 0.10;  // never bid below 0.10
+const BID_MAX            = 0.90;  // never bid above 0.90
+const BUDGET_PER_SIDE    = 100;   // $100 per side per window
+const STARTING_BALANCE   = 2000;
 
-// ─── POSITION SIZER ───────────────────────────────────────────────────────────
-function calcShares(riskFraction, price, minShares, maxShares) {
-  const safeCap = Math.max(0, state.settledCapital || state.capital);
-  const raw     = (safeCap * riskFraction) / Math.max(price, 0.05);
-  return Math.min(maxShares, Math.max(minShares, Math.floor(raw / 5) * 5));
-}
+// Polymarket fee model
+// Taker pays 2 % of notional (price × shares)
+// Maker receives 20 % of that taker fee → 0.4 % of notional
+const TAKER_FEE_RATE   = 0.020;   // 2 %  — charged when WE sell as taker
+const MAKER_REBATE_RATE = 0.004;  // 0.4 % — credited when someone else takes our bid
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
-const CONFIG = {
-  DEMO_CAPITAL:    parseFloat(process.env.DEMO_CAPITAL || '2000'),
-  PORT:            parseInt(process.env.PORT || '3000'),
-  ASSETS:          (process.env.ASSETS || 'btc,eth,sol').split(','),
-  WINDOW_SEC:      900,
-  PRICE_REFRESH_MS: 2500,
+const BINANCE_WS = 'wss://stream.binance.com:9443/ws/btcusdt@aggTrade';
+const RESOLVE_DELAY_SECS = 60;
 
-  // S1: Maker Quote Engine  ±2¢
-  MAKER_SPREAD:         0.04,
-  MAKER_HALF:           0.02,
-  MAKER_RISK:           0.006,
-  MAKER_MIN_SH:         20,
-  MAKER_MAX_SH:         400,
-  MAKER_MAX_BIDS:       6,
-  MAKER_MAX_ASKS:       6,
-  MAKER_REQUOTE_DRIFT:  0.015,
-  MAKER_COOLDOWN:       3,
-  MAKER_STOP:           0.06,
-
-  // S4: Maker Scalp  ±2.5¢
-  SCALP_HALF:           0.025,
-  SCALP_RISK:           0.004,
-  SCALP_MIN_SH:         15,
-  SCALP_MAX_SH:         300,
-  SCALP_MAX_BIDS:       6,
-  SCALP_MAX_ASKS:       6,
-  SCALP_REQUOTE:        0.020,
-  SCALP_STOP:           0.06,
-  SCALP_COOLDOWN:       3,
-  SCALP_MIN_SECS:       45,
-
-  EMERGENCY_SECS:      10,
-  WIN_THRESHOLD:       0.97,
-  REBATE_RATE:         0.20,
+// ── State ─────────────────────────────────────────────────────────────────────
+let state = {
+  balance:         STARTING_BALANCE,
+  totalPnl:        0,
+  totalRebates:    0,   // lifetime maker rebates earned
+  totalTakerFees:  0,   // lifetime taker fees paid
+  windowState:     null,
+  pendingWindows:  [],
+  resolvedWindows: [],
 };
 
-// ─── CAPITAL MUTEX ────────────────────────────────────────────────────────────
-let _capitalQueue = Promise.resolve();
-function adjustCapital(delta) {
-  _capitalQueue = _capitalQueue.then(() => {
-    state.capital        = parseFloat((state.capital + delta).toFixed(6));
-    if (state.capital < 0) state.capital = 0;
-    state.settledCapital = state.capital;
+/*  windowState shape:
+    {
+      windowStart: <unix-ts>,
+      slug:        <string>,
+      upToken:     <string>,
+      dnToken:     <string>,
+      // UP side
+      upBids:      [ { id, limitPrice, shares, cost, placedAt } ],  // open bids
+      upFills:     [ { id, fillPrice, shares, cost, rebate, filledAt } ],
+      upInventory: <shares held>,
+      upSpent:     <total $ spent on UP fills this window>,
+      upRebates:   <total rebates from UP fills this window>,
+      upBidPlaced: <bool — do we have an open bid right now>,
+      // DOWN side
+      dnBids:      [],
+      dnFills:     [],
+      dnInventory: <shares>,
+      dnSpent:     <total $ spent>,
+      dnRebates:   <total rebates>,
+      dnBidPlaced: <bool>,
+      // Merge results
+      merged:          false,
+      matchedPairs:    0,
+      mergeProceeds:   0,
+      takerUpShares:   0,
+      takerDnShares:   0,
+      takerProceeds:   0,
+      takerFeesPaid:   0,
+      windowPnl:       null,   // set after merge
+      status:          'active' | 'merged' | 'resolved',
+    }
+*/
+
+let equityCurve  = [];
+const priceBook  = {};          // tokenId → { bid, ask }
+const marketCache= {};          // 'btc-5m:CWS' → { upToken, dnToken, slug }
+let   btcPrice   = 0;
+let   btcWs      = null;
+
+let emitFn = () => {};
+let logFn  = () => {};
+
+// ── Pure math helpers ─────────────────────────────────────────────────────────
+function fl2(n){ return Math.round(n * 100) / 100; }
+function fl4(n){ return Math.round(n * 10000) / 10000; }
+// integer penny-safe add / subtract
+function addM(a, b){ return fl2((a * 100 + b * 100) / 100); }
+function subM(a, b){ return fl2((a * 100 - b * 100) / 100); }
+
+function sharesForBudget(budget, price){
+  // How many whole shares can we buy with 'budget' at 'price'?
+  if (price <= 0) return 0;
+  return Math.floor(budget / price);
+}
+function makerRebate(shares, price){
+  // Maker earns 0.4 % of (shares × price) when a taker fills our bid
+  return fl4(shares * price * MAKER_REBATE_RATE);
+}
+function takerFee(shares, price){
+  // We pay 2 % of notional when we sell as taker
+  return fl4(shares * price * TAKER_FEE_RATE);
+}
+function tradeId(){ return `M${Date.now().toString(36).toUpperCase()}`; }
+
+// ── Persist ───────────────────────────────────────────────────────────────────
+function loadState(){
+  try {
+    if (fs.existsSync(TRADES_FILE)){
+      const raw = JSON.parse(fs.readFileSync(TRADES_FILE, 'utf8'));
+      state = { ...state, ...raw };
+      if (!state.pendingWindows)  state.pendingWindows  = [];
+      if (!state.resolvedWindows) state.resolvedWindows = [];
+      if (!state.totalRebates)    state.totalRebates    = 0;
+      if (!state.totalTakerFees)  state.totalTakerFees  = 0;
+    }
+  } catch(e){ log(`⚠️  State load: ${e.message}`); }
+}
+function saveState(){ fs.writeFileSync(TRADES_FILE, JSON.stringify(state, null, 2)); }
+
+function loadEquity(){
+  try {
+    if (fs.existsSync(EQUITY_FILE)){
+      equityCurve = JSON.parse(fs.readFileSync(EQUITY_FILE, 'utf8'));
+      if (!Array.isArray(equityCurve)) equityCurve = [];
+    }
+  } catch(_){ equityCurve = []; }
+}
+function saveEquity(){ fs.writeFileSync(EQUITY_FILE, JSON.stringify(equityCurve)); }
+
+function recordEquity(){
+  equityCurve.push({
+    ts:      Date.now(),
+    balance: fl2(state.balance),
+    pnl:     fl4(state.totalPnl),
+    rebates: fl4(state.totalRebates),
   });
-  return _capitalQueue;
+  if (equityCurve.length > 2000) equityCurve = equityCurve.slice(-2000);
+  saveEquity();
 }
 
-// ─── STATE ────────────────────────────────────────────────────────────────────
-const state = {
-  capital: 0, startCapital: 0, settledCapital: 0,
-  windows: {}, prices: {}, lastResolution: {}, lastResBySlug: {},
-  history: [], logs: [],
-  feesPaid: 0, rebatesEarned: 0, liqRewards: 0,
-  roundTrips: 0, overfillsBlocked: 0,
-  equity: [],   // [{ts, capital}]
-};
+// ── Logger ────────────────────────────────────────────────────────────────────
+function log(msg){
+  const line = `[${new Date().toISOString().replace('T',' ').slice(0,19)}] ${msg}`;
+  console.log(line);
+  logFn(line);
+}
 
-function makeWindowState(asset) {
+// ── Window helpers ────────────────────────────────────────────────────────────
+function currentWindowStart(){
+  return Math.floor(Math.floor(Date.now() / 1000) / WINDOW_SIZE) * WINDOW_SIZE;
+}
+function windowElapsed(){
+  return Math.floor(Date.now() / 1000) - currentWindowStart();
+}
+function windowRemaining(){
+  return WINDOW_SIZE - windowElapsed();
+}
+function getBid(tid){
+  return (priceBook[tid] && priceBook[tid].bid > 0) ? priceBook[tid].bid : 0;
+}
+function getAsk(tid){
+  return (priceBook[tid] && priceBook[tid].ask > 0) ? priceBook[tid].ask : 0;
+}
+function getMid(tid){
+  const b = priceBook[tid];
+  if (!b) return 0;
+  if (b.bid > 0 && b.ask > 0) return (b.bid + b.ask) / 2;
+  return b.bid || b.ask || 0;
+}
+
+// ── Binance price feed ────────────────────────────────────────────────────────
+function connectBinance(){
+  if (btcWs){ try{ btcWs.terminate(); }catch(_){} }
+  const ws = new WebSocket(BINANCE_WS);
+  ws.on('open',    () => log('✅ Binance BTC/USD connected'));
+  ws.on('message', raw => {
+    try {
+      const p = parseFloat(JSON.parse(raw).p);
+      if (p > 0) btcPrice = p;
+    } catch(_){}
+  });
+  ws.on('close', () => setTimeout(connectBinance, 3000));
+  ws.on('error', () => {});
+  btcWs = ws;
+}
+
+// ── Market discovery (reuse from original) ────────────────────────────────────
+function extractTokenIds(mkt){
+  if (!mkt) return null;
+  let ids = mkt.clobTokenIds ?? mkt.clob_token_ids;
+  if (typeof ids === 'string'){ try{ ids = JSON.parse(ids); }catch(_){ ids = null; } }
+  let outcomes = mkt.outcomes;
+  if (typeof outcomes === 'string'){ try{ outcomes = JSON.parse(outcomes); }catch(_){ outcomes = null; } }
+  if (Array.isArray(ids) && ids.length >= 2 && ids[0] && ids[1]){
+    if (Array.isArray(outcomes) && outcomes.length >= 2){
+      const ui = outcomes.findIndex(o => /up/i.test(String(o)));
+      const di = outcomes.findIndex(o => /down/i.test(String(o)));
+      if (ui >= 0 && di >= 0) return { upToken: String(ids[ui]), dnToken: String(ids[di]) };
+    }
+    return { upToken: String(ids[0]), dnToken: String(ids[1]) };
+  }
+  if (Array.isArray(mkt.tokens) && mkt.tokens.length >= 2){
+    const up = mkt.tokens.find(t => /up|yes/i.test(t.outcome ?? ''));
+    const dn = mkt.tokens.find(t => /down|no/i.test(t.outcome ?? ''));
+    if (up?.token_id && dn?.token_id) return { upToken: up.token_id, dnToken: dn.token_id };
+    return { upToken: mkt.tokens[0].token_id, dnToken: mkt.tokens[1].token_id };
+  }
+  return null;
+}
+
+async function getJson(url){
+  try {
+    const res = await fetch(url, { timeout: 10000 });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data) ? (data[0] ?? null) : (data ?? null);
+  } catch(_){ return null; }
+}
+
+function seedPrices(mkt, tokens){
+  let prices = mkt.outcomePrices, outcomes = mkt.outcomes;
+  if (typeof prices   === 'string'){ try{ prices   = JSON.parse(prices);   }catch(_){ prices   = null; } }
+  if (typeof outcomes === 'string'){ try{ outcomes = JSON.parse(outcomes); }catch(_){ outcomes = null; } }
+  const bestAsk = parseFloat(mkt.bestAsk ?? 0) || 0;
+  const bestBid = parseFloat(mkt.bestBid ?? 0) || 0;
+  if (bestAsk > 0 || bestBid > 0){
+    priceBook[tokens.upToken] = { bid: bestBid, ask: bestAsk };
+    priceBook[tokens.dnToken] = { bid: Math.max(0, 1 - bestAsk), ask: Math.min(1, 1 - bestBid) };
+  } else if (Array.isArray(prices) && Array.isArray(outcomes)){
+    const ui = outcomes.findIndex(o => /up/i.test(String(o)));
+    const di = outcomes.findIndex(o => /down/i.test(String(o)));
+    if (ui >= 0 && di >= 0){
+      const up = parseFloat(prices[ui]) || 0;
+      const dn = parseFloat(prices[di]) || 0;
+      if (up > 0) priceBook[tokens.upToken] = { bid: Math.max(0, up - 0.01), ask: Math.min(1, up + 0.01) };
+      if (dn > 0) priceBook[tokens.dnToken] = { bid: Math.max(0, dn - 0.01), ask: Math.min(1, dn + 0.01) };
+    }
+  }
+}
+
+let discovering = false;
+async function refreshMarket(){
+  if (discovering) return;
+  discovering = true;
+  try {
+    const cws      = currentWindowStart();
+    const cacheKey = `${MARKET_ID}:${cws}`;
+    if (marketCache[cacheKey]){ discovering = false; return; }
+
+    for (const offset of [0, 1, -1, 2, -2]){
+      const t    = cws + offset * WINDOW_SIZE;
+      const slug = `${MARKET_SLUG}-${t}`;
+      const ev   = await getJson(`${GAMMA}/events/slug/${slug}`);
+      if (ev?.markets?.length){
+        const mkt    = ev.markets.find(m => m.acceptingOrders !== false) ?? ev.markets[0];
+        const tokens = extractTokenIds(mkt);
+        if (tokens){
+          seedPrices(mkt, tokens);
+          marketCache[cacheKey] = { windowStart: cws, upToken: tokens.upToken, dnToken: tokens.dnToken, slug };
+          log(`✅ [BTC] Found ${slug}`);
+          break;
+        }
+      }
+      const mkt2 = await getJson(`${GAMMA}/markets/slug/${slug}`);
+      if (mkt2){
+        const tokens = extractTokenIds(mkt2);
+        if (tokens){
+          seedPrices(mkt2, tokens);
+          marketCache[cacheKey] = { windowStart: cws, upToken: tokens.upToken, dnToken: tokens.dnToken, slug };
+          log(`✅ [BTC] Found ${slug}`);
+          break;
+        }
+      }
+    }
+  } finally { discovering = false; }
+}
+
+async function pollPrices(){
+  const cws = currentWindowStart();
+  const w   = marketCache[`${MARKET_ID}:${cws}`];
+  const extraTokens = new Set();
+  for (const pw of state.pendingWindows){
+    if (pw.upToken) extraTokens.add(pw.upToken);
+    if (pw.dnToken) extraTokens.add(pw.dnToken);
+  }
+  const tokens = w
+    ? [w.upToken, w.dnToken, ...extraTokens]
+    : [...extraTokens];
+
+  await Promise.all(tokens.map(async tid => {
+    try {
+      const [ar, br] = await Promise.all([
+        fetch(`${CLOB_REST}/price?token_id=${tid}&side=BUY`,  { timeout: 3000 }),
+        fetch(`${CLOB_REST}/price?token_id=${tid}&side=SELL`, { timeout: 3000 }),
+      ]);
+      const ask = parseFloat((await ar.json()).price ?? 0) || 0;
+      const bid = parseFloat((await br.json()).price ?? 0) || 0;
+      if (ask > 0 || bid > 0) priceBook[tid] = { bid, ask };
+    } catch(_){}
+  }));
+}
+
+// ── Window state management ───────────────────────────────────────────────────
+function freshWindowState(cws, w){
   return {
-    asset, windowTs: null, windowSlug: null, marketId: null,
-    status: 'WAITING',
-    // S1 — separate bid/ask arrays per side
-    makerBidsUp: [],   makerAsksUp:   [],
-    makerBidsDown: [], makerAsksDown: [],
-    // S4
-    scalpBidsUp: [],   scalpAsksUp:   [],
-    scalpBidsDown: [], scalpAsksDown: [],
-    // Quote tracking
-    makerMidUp: null, makerMidDown: null,
-    scalpMidUp: null, scalpMidDown: null,
-    // Cooldowns: priceKey → ticks remaining
-    bidCooldowns: {},
-    tickCount: 0,
-    realizedPnl: 0, feePaid: 0, tradeCount: 0,
-    rebates: 0,
-    orders: [],
+    windowStart:  cws,
+    slug:         w.slug,
+    upToken:      w.upToken,
+    dnToken:      w.dnToken,
+    // UP side
+    upBids:       [],
+    upFills:      [],
+    upInventory:  0,
+    upSpent:      0,
+    upRebates:    0,
+    upBidPlaced:  false,
+    upBudgetLeft: BUDGET_PER_SIDE,
+    // DOWN side
+    dnBids:       [],
+    dnFills:      [],
+    dnInventory:  0,
+    dnSpent:      0,
+    dnRebates:    0,
+    dnBidPlaced:  false,
+    dnBudgetLeft: BUDGET_PER_SIDE,
+    // Merge
+    merged:        false,
+    matchedPairs:  0,
+    mergeProceeds: 0,
+    takerUpShares: 0,
+    takerDnShares: 0,
+    takerProceeds: 0,
+    takerFeesPaid: 0,
+    windowPnl:     null,
+    status:        'active',
   };
 }
 
-function initState() {
-  state.capital = state.startCapital = state.settledCapital = CONFIG.DEMO_CAPITAL;
-  CONFIG.ASSETS.forEach(a => {
-    state.windows[a]        = makeWindowState(a);
-    state.prices[a]         = null;
-    state.lastResolution[a] = null;
+function ensureWindowState(){
+  const cws = currentWindowStart();
+  const w   = marketCache[`${MARKET_ID}:${cws}`];
+  if (!w) return;
+
+  // If no window state yet, or it's from a previous window → rotate
+  if (!state.windowState || state.windowState.windowStart !== cws){
+    // Archive old window if it had fills and wasn't fully handled
+    if (state.windowState && state.windowState.windowStart !== cws){
+      archiveWindow(state.windowState);
+    }
+    state.windowState = freshWindowState(cws, w);
+    log(`🆕 [BTC] New window started — ${new Date(cws * 1000).toLocaleTimeString()}`);
+    saveState();
+  }
+}
+
+function archiveWindow(ws){
+  if (!ws || (ws.upFills.length === 0 && ws.dnFills.length === 0)) return;
+  // If merge wasn't done (e.g. bot restarted mid-window), force merge now
+  if (!ws.merged) doMerge(ws, true);
+  state.pendingWindows.push({
+    windowKey:   `btc:${ws.windowStart}`,
+    windowStart: ws.windowStart,
+    slug:        ws.slug,
+    upToken:     ws.upToken,
+    dnToken:     ws.dnToken,
+    upFills:     ws.upFills,
+    dnFills:     ws.dnFills,
+    upInventory: ws.upInventory,
+    dnInventory: ws.dnInventory,
+    upSpent:     ws.upSpent,
+    dnSpent:     ws.dnSpent,
+    upRebates:   ws.upRebates,
+    dnRebates:   ws.dnRebates,
+    merged:      ws.merged,
+    matchedPairs:  ws.matchedPairs,
+    mergeProceeds: ws.mergeProceeds,
+    takerUpShares: ws.takerUpShares,
+    takerDnShares: ws.takerDnShares,
+    takerProceeds: ws.takerProceeds,
+    takerFeesPaid: ws.takerFeesPaid,
+    windowPnl:   ws.windowPnl,
+    status:      'pending',
+    archivedAt:  new Date().toISOString(),
   });
-  state.equity.push({ ts: Date.now(), capital: CONFIG.DEMO_CAPITAL });
+  log(`📦 [BTC] Window archived for resolution — ${ws.upFills.length} UP fills, ${ws.dnFills.length} DN fills`);
 }
 
-let globalTick = 0, globalOrderSeq = 0;
-const emitter = new EventEmitter();
-emitter.setMaxListeners(500);
+// ── CORE: Place maker bids ────────────────────────────────────────────────────
+//
+//  We post a limit BID at (current best bid + BID_OFFSET).
+//  This puts us at the TOP of the bid book → we get filled first.
+//  We are the MAKER → zero fee, plus 0.4% rebate when a taker hits us.
+//
+function placeMakerBid(side){
+  const ws      = state.windowState;
+  if (!ws || ws.status !== 'active') return;
+  const tokenId = side === 'UP' ? ws.upToken : ws.dnToken;
+  const budget  = side === 'UP' ? ws.upBudgetLeft : ws.dnBudgetLeft;
+  if (budget < 1) return; // no budget left this window
 
-// ─── LOGGING ─────────────────────────────────────────────────────────────────
-function log(level, msg) {
-  const entry = { id: uuidv4(), ts: Date.now(), level, msg };
-  state.logs.unshift(entry);
-  if (state.logs.length > 500) state.logs.pop();
-  console.log(`[${level.toUpperCase()}] ${msg}`);
-  emitter.emit('log', entry);
+  const bestBid = getBid(tokenId);
+  if (bestBid <= 0) return; // no price data yet
+
+  // Our bid price: just above the current best bid, within range
+  const rawBid  = fl2(bestBid + BID_OFFSET);
+  const bidPrice= Math.min(BID_MAX, Math.max(BID_MIN, rawBid));
+
+  const shares  = sharesForBudget(budget, bidPrice);
+  if (shares <= 0) return;
+
+  const cost    = fl2(shares * bidPrice);
+  const rebate  = makerRebate(shares, bidPrice);
+  const order   = {
+    id:        tradeId(),
+    side,
+    bidPrice,
+    shares,
+    cost,
+    rebate,
+    placedAt:  new Date().toISOString(),
+  };
+
+  if (side === 'UP'){ ws.upBids.push(order); ws.upBidPlaced = true; }
+  else              { ws.dnBids.push(order); ws.dnBidPlaced = true; }
+
+  log(`📋 [BTC] ${side} MAKER BID @${bidPrice.toFixed(2)} × ${shares} sh | cost=$${cost.toFixed(2)} | est.rebate=$${rebate.toFixed(4)}`);
+  saveState();
 }
 
-// ─── TIME ─────────────────────────────────────────────────────────────────────
-function currentWindowTs()   { return Math.floor(Math.floor(Date.now()/1000)/900)*900; }
-function secondsIntoWindow() { return Math.floor(Date.now()/1000) - currentWindowTs(); }
-function secondsLeft()       { return CONFIG.WINDOW_SEC - secondsIntoWindow(); }
-function makeSlug(asset, ts) { return `${asset}-updown-15m-${ts}`; }
+// ── CORE: Simulate fill ───────────────────────────────────────────────────────
+//
+//  A maker bid is "filled" when the live price moves DOWN to our bid level
+//  (a taker sells into our resting bid).
+//
+function checkFills(){
+  const ws = state.windowState;
+  if (!ws || ws.status !== 'active') return;
 
-// ─── MARKET DISCOVERY ─────────────────────────────────────────────────────────
-// Exact approach from your working script:
-// GET /markets?slug=btc-updown-15m-{ts}
-// → outcomes[] + clobTokenIds[] → map by "Up"/"Down" label
+  for (const side of ['UP', 'DOWN']){
+    const bids    = side === 'UP' ? ws.upBids : ws.dnBids;
+    const tokenId = side === 'UP' ? ws.upToken : ws.dnToken;
+    const curBid  = getBid(tokenId); // live best bid in market
+    if (curBid <= 0) continue;
 
-const tokenCache = {};
+    for (let i = bids.length - 1; i >= 0; i--){
+      const order = bids[i];
+      // Fill condition: market bid has dropped to or below our posted bid
+      // (meaning our bid is now at or above market → a taker will hit us)
+      if (curBid <= order.bidPrice){
+        // ── FILL ──────────────────────────────────────────────────────────
+        const fill = {
+          id:        order.id,
+          side,
+          fillPrice: order.bidPrice,
+          shares:    order.shares,
+          cost:      order.cost,       // shares × fillPrice
+          rebate:    order.rebate,     // 0.4 % of notional
+          filledAt:  new Date().toISOString(),
+        };
 
-async function resolveMarketTokens(slug) {
-  if (tokenCache[slug]) return tokenCache[slug];
-  try {
-    const res  = await axios.get(`${GAMMA_URL}/markets`, { params: { slug }, timeout: 8000 });
-    const list = Array.isArray(res.data) ? res.data : [res.data];
-    const mkt  = list.find(m => m && m.slug === slug);
-    if (!mkt) { log('warn', `Market not found yet: ${slug}`); return null; }
+        // Deduct cost from balance, credit rebate immediately
+        state.balance    = subM(state.balance, fill.cost);
+        state.balance    = addM(state.balance, fill.rebate);
+        state.totalRebates = fl4(state.totalRebates + fill.rebate);
 
-    const outcomes = typeof mkt.outcomes     === 'string' ? JSON.parse(mkt.outcomes)     : (mkt.outcomes     || []);
-    const tokenIds = typeof mkt.clobTokenIds === 'string' ? JSON.parse(mkt.clobTokenIds) : (mkt.clobTokenIds || []);
+        if (side === 'UP'){
+          ws.upFills.push(fill);
+          ws.upInventory   += fill.shares;
+          ws.upSpent        = fl2(ws.upSpent + fill.cost);
+          ws.upRebates      = fl4(ws.upRebates + fill.rebate);
+          ws.upBudgetLeft   = fl2(Math.max(0, ws.upBudgetLeft - fill.cost));
+          ws.upBidPlaced    = false;  // allow new bid
+          bids.splice(i, 1);
+        } else {
+          ws.dnFills.push(fill);
+          ws.dnInventory   += fill.shares;
+          ws.dnSpent        = fl2(ws.dnSpent + fill.cost);
+          ws.dnRebates      = fl4(ws.dnRebates + fill.rebate);
+          ws.dnBudgetLeft   = fl2(Math.max(0, ws.dnBudgetLeft - fill.cost));
+          ws.dnBidPlaced    = false;
+          bids.splice(i, 1);
+        }
 
-    // Map by label: "Up" → tokenIds[i], "Down" → tokenIds[i]
-    let upTokenId = null, downTokenId = null;
-    outcomes.forEach((o, i) => {
-      const n = (o || '').toLowerCase();
-      if (n === 'up')   upTokenId   = tokenIds[i];
-      if (n === 'down') downTokenId = tokenIds[i];
-    });
-    // Fallback: index 0 = UP, 1 = DOWN
-    if (!upTokenId   && tokenIds[0]) upTokenId   = tokenIds[0];
-    if (!downTokenId && tokenIds[1]) downTokenId = tokenIds[1];
-
-    const result = { upTokenId, downTokenId, marketId: mkt.id || mkt.conditionId, closed: !!mkt.closed, resolved: !!mkt.resolved };
-    tokenCache[slug] = result;
-    log('info', `✅ TOKENS: ${slug} | up=${upTokenId?.slice(0,12)}... down=${downTokenId?.slice(0,12)}...`);
-    return result;
-  } catch (err) {
-    log('error', `resolveMarketTokens(${slug}): ${err.message}`);
-    return null;
+        log(`✅ [BTC] ${side} FILLED @${fill.fillPrice.toFixed(2)} × ${fill.shares} sh | cost=$${fill.cost.toFixed(2)} | rebate=+$${fill.rebate.toFixed(4)} | bal=$${state.balance.toFixed(2)}`);
+        saveState();
+      }
+    }
   }
 }
 
-// ─── LIVE PRICE FETCH ─────────────────────────────────────────────────────────
-// Uses /midpoint for the live mid price and /book for depth display
+// ── CORE: Merge at T-60 s ─────────────────────────────────────────────────────
+//
+//  MERGE MATH:
+//    matched = min(upInventory, downInventory)
+//    mergeProceeds = matched × $1.00              ← guaranteed, riskless
+//    leftoverUp   = upInventory  - matched
+//    leftoverDown = downInventory - matched
+//    takerProceeds = (leftoverUp × upMid) + (leftoverDown × dnMid)
+//    takerFeesPaid = takerFee(leftoverUp, upMid) + takerFee(leftoverDown, dnMid)
+//
+//    windowPnl = mergeProceeds + takerProceeds - takerFeesPaid
+//                + upRebates + dnRebates
+//                - upSpent - dnSpent
+//
+function doMerge(ws, forced){
+  if (ws.merged) return;
+  ws.merged = true;
 
-async function fetchLivePrices(asset) {
-  const slug   = makeSlug(asset, currentWindowTs());
-  const tokens = await resolveMarketTokens(slug);
-  if (!tokens?.upTokenId) return null;
+  const upInv = ws.upInventory;
+  const dnInv = ws.dnInventory;
 
-  try {
-    const [upR, dnR] = await Promise.all([
-      axios.get(`${CLOB_URL}/midpoint`, { params: { token_id: tokens.upTokenId   }, timeout: 5000 }),
-      axios.get(`${CLOB_URL}/midpoint`, { params: { token_id: tokens.downTokenId }, timeout: 5000 }),
-    ]);
-    const up   = parseFloat(upR.data.mid);
-    const down = parseFloat(dnR.data.mid);
-    if (isNaN(up) || isNaN(down)) return null;
-    return { slug, marketId: tokens.marketId, up, down, live: true };
-  } catch (err) {
-    log('error', `fetchLivePrices(${asset}): ${err.message}`);
-    return null;
-  }
-}
-
-// Fetch full book for depth display — called separately, slower
-async function fetchBookDepth(tokenId) {
-  try {
-    const res = await axios.get(`${CLOB_URL}/book`, { params: { token_id: tokenId }, timeout: 5000 });
-    return res.data;
-  } catch { return null; }
-}
-
-// ─── EXECUTION ────────────────────────────────────────────────────────────────
-async function execBuy(win, side, shares, requestedPrice, type, isMaker) {
-  const curP     = side === 'UP' ? state.prices[win.asset]?.up : state.prices[win.asset]?.down;
-  const fillPrice  = isMaker ? requestedPrice : simTakerFillPrice(curP ?? requestedPrice, true);
-  const fillShares = simPartialFill(shares, !isMaker);
-  if (fillShares <= 0) return null;
-
-  const fee  = isMaker ? 0 : takerFee(fillShares, fillPrice);
-  const cost = fillShares * fillPrice + fee;
-  await adjustCapital(-cost);
-
-  // Rebate fires on BUY fill (maker resting order hit by taker)
-  const rebate = isMaker ? takerFee(fillShares, fillPrice) * CONFIG.REBATE_RATE : 0;
-  if (rebate > 0) {
-    win.rebates += rebate;
-    state.rebatesEarned += rebate;
+  if (upInv === 0 && dnInv === 0){
+    ws.windowPnl = 0;
+    ws.status    = 'merged';
+    log(`⚡ [BTC] Merge: no inventory — window P&L = $0`);
+    return;
   }
 
-  win.feePaid += fee; state.feesPaid += fee; win.tradeCount++; globalOrderSeq++;
-  win.orders.push({ id: uuidv4(), seq: globalOrderSeq, side, type, action: 'BUY',
-    shares: fillShares, price: fillPrice, fee, cost, isMaker, time: Date.now() });
+  // Matched pairs: guaranteed $1 each
+  const matched      = Math.min(upInv, dnInv);
+  const mergeProceeds = fl2(matched * 1.00);
 
-  log('trade', `🟢 BUY [${type}] ${win.asset.toUpperCase()} ${side} +${fillShares}sh @ ${fillPrice.toFixed(4)} | ${isMaker?'MAKER $0':(`fee=$${fee.toFixed(3)}`)} | cap=$${state.capital.toFixed(2)}`);
-  emitter.emit('state_update', getPublicState());
-  return { fillPrice, fillShares, cost };
+  // Leftover: sell as taker
+  const leftoverUp = upInv - matched;
+  const leftoverDn = dnInv - matched;
+
+  const upMid = getMid(ws.upToken);
+  const dnMid = getMid(ws.dnToken);
+
+  const takerProceedsUp = fl2(leftoverUp * upMid);
+  const takerProceedsDn = fl2(leftoverDn * dnMid);
+  const takerFeeUp      = takerFee(leftoverUp, upMid);
+  const takerFeeDn      = takerFee(leftoverDn, dnMid);
+
+  const totalTakerProceeds = fl2(takerProceedsUp + takerProceedsDn);
+  const totalTakerFees     = fl4(takerFeeUp + takerFeeDn);
+
+  // Credit merge proceeds and taker proceeds to balance
+  state.balance = addM(state.balance, mergeProceeds);
+  state.balance = addM(state.balance, totalTakerProceeds);
+  state.balance = subM(state.balance, totalTakerFees);
+  state.totalTakerFees = fl4(state.totalTakerFees + totalTakerFees);
+
+  // Window P&L = everything in – everything spent
+  const totalIn  = mergeProceeds + totalTakerProceeds - totalTakerFees
+                   + ws.upRebates + ws.dnRebates;
+  const totalOut = ws.upSpent + ws.dnSpent;
+  const windowPnl = fl4(totalIn - totalOut);
+
+  state.totalPnl = fl4(state.totalPnl + windowPnl);
+
+  ws.matchedPairs   = matched;
+  ws.mergeProceeds  = mergeProceeds;
+  ws.takerUpShares  = leftoverUp;
+  ws.takerDnShares  = leftoverDn;
+  ws.takerProceeds  = totalTakerProceeds;
+  ws.takerFeesPaid  = totalTakerFees;
+  ws.windowPnl      = windowPnl;
+  ws.status         = 'merged';
+
+  const label = forced ? '⚡ [BTC] FORCED MERGE' : '⚡ [BTC] MERGE T-60s';
+  log(`${label} | pairs=${matched} → $${mergeProceeds.toFixed(2)} | ↑left=${leftoverUp} ↓left=${leftoverDn} → taker $${totalTakerProceeds.toFixed(2)} fee=$${totalTakerFees.toFixed(4)} | rebates=$${(ws.upRebates+ws.dnRebates).toFixed(4)} | windowPnl=${windowPnl >= 0 ? '+' : ''}$${windowPnl.toFixed(4)} | bal=$${state.balance.toFixed(2)}`);
+  recordEquity();
+  saveState();
 }
 
-async function execSell(win, side, shares, requestedPrice, type, costBasis, isMaker) {
-  const curP      = side === 'UP' ? state.prices[win.asset]?.up : state.prices[win.asset]?.down;
-  const fillPrice  = isMaker ? requestedPrice : simTakerFillPrice(curP ?? requestedPrice, false);
-  const fillShares = Math.min(shares, simPartialFill(shares, !isMaker));
-  if (fillShares <= 0) return false;
+// ── Resolution: any unmerged positions (e.g. forced archive) ──────────────────
+const lastResolvLog = {};
+async function checkResolution(){
+  const nowSec    = Math.floor(Date.now() / 1000);
+  const toResolve = state.pendingWindows.filter(w =>
+    nowSec >= w.windowStart + WINDOW_SIZE + RESOLVE_DELAY_SECS && w.status === 'pending'
+  );
 
-  const fee      = isMaker ? 0 : takerFee(fillShares, fillPrice);
-  const proceeds = fillShares * fillPrice - fee;
-  const scaled   = costBasis * (fillShares / shares);
-  const pnl      = proceeds - scaled;
-  await adjustCapital(proceeds);
+  for (const pw of toResolve){
+    // If already merged, just move to resolved
+    if (pw.merged){
+      pw.status     = 'resolved';
+      pw.resolvedAt = new Date().toISOString();
+      state.pendingWindows  = state.pendingWindows.filter(w => w.windowKey !== pw.windowKey);
+      state.resolvedWindows.unshift(pw);
+      if (state.resolvedWindows.length > 50) state.resolvedWindows = state.resolvedWindows.slice(0, 50);
+      recordEquity(); saveState();
+      log(`✅ [BTC] Window ${new Date(pw.windowStart*1000).toLocaleTimeString()} resolved (merged) — P&L=${pw.windowPnl >= 0 ? '+' : ''}$${(pw.windowPnl||0).toFixed(4)}`);
+      emitFn('snapshot', buildSnapshot());
+      continue;
+    }
 
-  win.realizedPnl += pnl; win.feePaid += fee; state.feesPaid += fee;
-  win.tradeCount++; globalOrderSeq++;
-  win.orders.push({ id: uuidv4(), seq: globalOrderSeq, side, type, action: 'SELL',
-    shares: fillShares, price: fillPrice, fee, proceeds, pnl, isMaker, time: Date.now() });
-
-  log('trade', `${pnl>=0?'💚':'🔻'} SELL [${type}] ${win.asset.toUpperCase()} ${side} -${fillShares}sh @ ${fillPrice.toFixed(4)} | pnl=${pnl>=0?'+':''}$${pnl.toFixed(3)} | cap=$${state.capital.toFixed(2)}`);
-  state.roundTrips++;
-  emitter.emit('state_update', getPublicState());
-  return true;
-}
-
-// ─── COOLDOWN HELPERS ─────────────────────────────────────────────────────────
-function priceKey(p)          { return p.toFixed(4); }
-function isCooling(win, p)    { return (win.bidCooldowns[priceKey(p)] || 0) > 0; }
-function setCooldown(win, p, ticks) { win.bidCooldowns[priceKey(p)] = ticks; }
-function tickCooldowns(win) {
-  for (const k of Object.keys(win.bidCooldowns)) {
-    if (--win.bidCooldowns[k] <= 0) delete win.bidCooldowns[k];
-  }
-}
-
-// ─── S1: MAKER QUOTE ENGINE ──────────────────────────────────────────────────
-async function runMakerQuote(win, side, price, secsLeft) {
-  if (secsLeft < CONFIG.EMERGENCY_SECS + 5) return;
-
-  const openBids  = side==='UP' ? win.makerBidsUp   : win.makerBidsDown;
-  const openAsks  = side==='UP' ? win.makerAsksUp   : win.makerAsksDown;
-  const midRefKey = side==='UP' ? 'makerMidUp'      : 'makerMidDown';
-
-  win.tickCount++;
-  tickCooldowns(win);
-
-  // PHASE A: try to exit filled bids (ask leg)
-  for (let i = openAsks.length - 1; i >= 0; i--) {
-    const ask      = openAsks[i];
-    ask.queuePos   = Math.max(1, (ask.queuePos || 3) - 1);
-    const askPrice = parseFloat((ask.limitPrice + CONFIG.MAKER_SPREAD).toFixed(4));
-
-    if (simMakerAskFillThisTick(price, askPrice, ask.queuePos)) {
-      const ok = await execSell(win, side, ask.filledShares, askPrice, 'S1_TP', ask.cost, true);
-      if (ok) {
-        openAsks.splice(i, 1);
-        setCooldown(win, ask.limitPrice, CONFIG.MAKER_COOLDOWN);
-        log('info', `✅ S1 SPREAD CAPTURED ${win.asset.toUpperCase()} ${side} | $${(CONFIG.MAKER_SPREAD * ask.filledShares).toFixed(2)} | ZERO FEE`);
+    // Not merged (forced archive without merge) → need Polymarket outcome
+    let mktData = await getJson(`${GAMMA}/markets/slug/${pw.slug}`);
+    if (!mktData){
+      const ev = await getJson(`${GAMMA}/events/slug/${pw.slug}`);
+      if (ev?.markets?.length) mktData = ev.markets[0];
+    }
+    if (!mktData){
+      const now = Date.now();
+      if (!lastResolvLog[pw.windowKey] || now - lastResolvLog[pw.windowKey] > 30000){
+        log(`⏳ [BTC] Cannot fetch market ${pw.slug} — retrying`);
+        lastResolvLog[pw.windowKey] = now;
       }
       continue;
     }
-    // Stop-loss: price 6¢ below entry or expiry
-    if (price <= ask.limitPrice - CONFIG.MAKER_STOP || secsLeft < 15) {
-      await execSell(win, side, ask.filledShares, price, 'S1_STOP', ask.cost, false);
-      openAsks.splice(i, 1);
-    }
-  }
 
-  // PHASE B: check fill on resting bids
-  for (let i = openBids.length - 1; i >= 0; i--) {
-    const bid = openBids[i];
-    if (bid.filled) { state.overfillsBlocked++; openBids.splice(i, 1); continue; }
-    if (bid.postedTick >= win.tickCount) continue;  // no same-tick fill
-    bid.queuePos = Math.max(1, (bid.queuePos || 5) - 1);
-
-    // Cancel if drifted too far
-    if (Math.abs(price - bid.limitPrice) > CONFIG.MAKER_SPREAD * 3) { openBids.splice(i, 1); continue; }
-
-    if (simMakerBidFillThisTick(price, bid.limitPrice, bid.queuePos)) {
-      const result = await execBuy(win, side, bid.shares, bid.limitPrice, 'S1_BID', true);
-      if (result) {
-        bid.filled = true; bid.filledShares = result.fillShares; bid.cost = result.cost;
-        openAsks.push({ limitPrice: bid.limitPrice, filledShares: result.fillShares,
-          cost: result.cost, queuePos: 1 + Math.floor(Math.random()*3), postedTick: win.tickCount });
-        openBids.splice(i, 1);
-        log('info', `📋 S1 BID FILLED→ASK ${win.asset.toUpperCase()} ${side} @ ${bid.limitPrice.toFixed(4)}`);
+    const isClosed = mktData.closed === true || mktData.active === false;
+    if (!isClosed){
+      const now = Date.now();
+      if (!lastResolvLog[pw.windowKey] || now - lastResolvLog[pw.windowKey] > 30000){
+        log(`⏳ [BTC] Waiting for Polymarket resolution — ${pw.slug}`);
+        lastResolvLog[pw.windowKey] = now;
       }
-    }
-  }
-
-  // PHASE C: post new resting bid if slot available
-  const needsQuote = win[midRefKey] === null || Math.abs(price - win[midRefKey]) > CONFIG.MAKER_REQUOTE_DRIFT;
-  const canPost    = openBids.length < CONFIG.MAKER_MAX_BIDS && openAsks.length < CONFIG.MAKER_MAX_ASKS && needsQuote && secsLeft > 30;
-
-  if (canPost) {
-    const bidPrice = parseFloat((price - CONFIG.MAKER_HALF).toFixed(4));
-    if (bidPrice > 0.01 && bidPrice < 0.99 && !isCooling(win, bidPrice)) {
-      const shares  = calcShares(CONFIG.MAKER_RISK, bidPrice, CONFIG.MAKER_MIN_SH, CONFIG.MAKER_MAX_SH);
-      const isDupe  = openBids.some(b => Math.abs(b.limitPrice - bidPrice) < 0.003);
-      if (!isDupe && shares > 0) {
-        openBids.push({ id: uuidv4(), shares, filledShares: 0, limitPrice: bidPrice,
-          queuePos: 1 + Math.floor(Math.random()*5), filled: false, postedTick: win.tickCount, postedAt: Date.now() });
-        win[midRefKey] = price;
-        log('info', `📌 S1 BID REST ${win.asset.toUpperCase()} ${side} @ ${bidPrice.toFixed(4)} | ${shares}sh | mid=${price.toFixed(4)}`);
-      }
-    }
-  }
-}
-
-// ─── S4: MAKER SCALP ENGINE ───────────────────────────────────────────────────
-async function runMakerScalp(win, side, price, secsLeft) {
-  if (secsLeft < CONFIG.SCALP_MIN_SECS) return;
-  if (price < 0.10 || price > 0.90) return;
-
-  const openBids  = side==='UP' ? win.scalpBidsUp   : win.scalpBidsDown;
-  const openAsks  = side==='UP' ? win.scalpAsksUp   : win.scalpAsksDown;
-  const midRefKey = side==='UP' ? 'scalpMidUp'      : 'scalpMidDown';
-
-  // PHASE A: exit
-  for (let i = openAsks.length - 1; i >= 0; i--) {
-    const ask      = openAsks[i];
-    ask.queuePos   = Math.max(1, (ask.queuePos || 3) - 1);
-    const askPrice = parseFloat((ask.limitPrice + 2 * CONFIG.SCALP_HALF).toFixed(4));
-
-    if (simMakerAskFillThisTick(price, askPrice, ask.queuePos)) {
-      await execSell(win, side, ask.filledShares, askPrice, 'S4_TP', ask.cost, true);
-      openAsks.splice(i, 1);
-      setCooldown(win, ask.limitPrice, CONFIG.SCALP_COOLDOWN);
-      log('info', `✂️  S4 SCALP CAPTURED ${win.asset.toUpperCase()} ${side} | ZERO FEE`);
       continue;
     }
-    if (price <= ask.limitPrice - CONFIG.SCALP_STOP) {
-      await execSell(win, side, ask.filledShares, price, 'S4_STOP', ask.cost, false);
-      openAsks.splice(i, 1);
+
+    let outcomePrices = mktData.outcomePrices, outcomes = mktData.outcomes;
+    if (typeof outcomePrices === 'string'){ try{ outcomePrices = JSON.parse(outcomePrices); }catch(_){ outcomePrices = null; } }
+    if (typeof outcomes      === 'string'){ try{ outcomes      = JSON.parse(outcomes);      }catch(_){ outcomes      = null; } }
+    if (!Array.isArray(outcomePrices) || outcomePrices.length < 2) continue;
+
+    let upIdx = 0, dnIdx = 1;
+    if (Array.isArray(outcomes)){
+      const ui = outcomes.findIndex(o => /up/i.test(String(o)));
+      const di = outcomes.findIndex(o => /down/i.test(String(o)));
+      if (ui >= 0 && di >= 0){ upIdx = ui; dnIdx = di; }
     }
+
+    const upRes = parseFloat(outcomePrices[upIdx]) || 0;
+    const dnRes = parseFloat(outcomePrices[dnIdx]) || 0;
+    if (upRes < 0.99 && dnRes < 0.99){
+      const now = Date.now();
+      if (!lastResolvLog[pw.windowKey] || now - lastResolvLog[pw.windowKey] > 30000){
+        log(`⏳ [BTC] Not fully resolved yet — UP=${upRes} DN=${dnRes}`);
+        lastResolvLog[pw.windowKey] = now;
+      }
+      continue;
+    }
+
+    const upWon = upRes >= 0.99;
+    // UP inventory resolves at $1 if UP won, $0 if DOWN won
+    // DN inventory resolves at $1 if DOWN won, $0 if UP won
+    const upResolvePrice = upWon ? 1.00 : 0.00;
+    const dnResolvePrice = upWon ? 0.00 : 1.00;
+
+    const upProceeds = fl2(pw.upInventory * upResolvePrice);
+    const dnProceeds = fl2(pw.dnInventory * dnResolvePrice);
+    const totalProceeds = fl2(upProceeds + dnProceeds);
+
+    state.balance  = addM(state.balance, totalProceeds);
+    const totalRebates = fl4((pw.upRebates || 0) + (pw.dnRebates || 0));
+    const totalSpent   = fl2((pw.upSpent || 0) + (pw.dnSpent || 0));
+    // rebates already credited at fill time, so pnl = proceeds - spent
+    // (rebates were already added to balance when fills happened)
+    const windowPnl    = fl4(totalProceeds - totalSpent);
+    state.totalPnl     = fl4(state.totalPnl + windowPnl);
+
+    pw.upWon      = upWon;
+    pw.windowPnl  = windowPnl;
+    pw.status     = 'resolved';
+    pw.resolvedAt = new Date().toISOString();
+
+    delete lastResolvLog[pw.windowKey];
+    state.pendingWindows  = state.pendingWindows.filter(w => w.windowKey !== pw.windowKey);
+    state.resolvedWindows.unshift(pw);
+    if (state.resolvedWindows.length > 50) state.resolvedWindows = state.resolvedWindows.slice(0, 50);
+
+    recordEquity(); saveState();
+    log(`${windowPnl >= 0 ? '🟢' : '🔴'} [BTC] RESOLVED — ${upWon ? 'UP' : 'DOWN'} WON | UP=${pw.upInventory}sh DN=${pw.dnInventory}sh | proceeds=$${totalProceeds.toFixed(2)} | pnl=${windowPnl >= 0 ? '+' : ''}$${windowPnl.toFixed(4)} | bal=$${state.balance.toFixed(2)}`);
+    emitFn('snapshot', buildSnapshot());
+  }
+}
+
+// ── Snapshot ──────────────────────────────────────────────────────────────────
+function buildSnapshot(){
+  const ws      = state.windowState;
+  const elapsed = windowElapsed();
+  const rem     = windowRemaining();
+
+  // Live floating value of current inventory (before merge)
+  let upFloatVal = 0, dnFloatVal = 0;
+  if (ws){
+    const upMid = getMid(ws.upToken);
+    const dnMid = getMid(ws.dnToken);
+    upFloatVal = fl2(ws.upInventory * upMid);
+    dnFloatVal = fl2(ws.dnInventory * dnMid);
   }
 
-  // PHASE B: fill resting bids
-  for (let i = openBids.length - 1; i >= 0; i--) {
-    const bid = openBids[i];
-    if (bid.filled) { openBids.splice(i, 1); continue; }
-    if (bid.postedTick >= win.tickCount) continue;
-    bid.queuePos = Math.max(1, (bid.queuePos || 5) - 1);
-    if (Math.abs(price - bid.limitPrice) > CONFIG.SCALP_HALF * 4) { openBids.splice(i, 1); continue; }
-
-    if (simMakerBidFillThisTick(price, bid.limitPrice, bid.queuePos)) {
-      const result = await execBuy(win, side, bid.shares, bid.limitPrice, 'S4_BID', true);
-      if (result) {
-        bid.filled = true;
-        openAsks.push({ limitPrice: bid.limitPrice, filledShares: result.fillShares,
-          cost: result.cost, queuePos: 1 + Math.floor(Math.random()*3), postedTick: win.tickCount });
-        openBids.splice(i, 1);
-      }
-    }
-  }
-
-  // PHASE C: post
-  const needsNew = win[midRefKey] === null || Math.abs(price - win[midRefKey]) > CONFIG.SCALP_REQUOTE;
-  const canPost  = openBids.length < CONFIG.SCALP_MAX_BIDS && openAsks.length < CONFIG.SCALP_MAX_ASKS && needsNew;
-
-  if (canPost) {
-    const bidPrice = parseFloat((price - CONFIG.SCALP_HALF).toFixed(4));
-    if (bidPrice > 0.01 && !isCooling(win, bidPrice)) {
-      const shares = calcShares(CONFIG.SCALP_RISK, bidPrice, CONFIG.SCALP_MIN_SH, CONFIG.SCALP_MAX_SH);
-      const isDupe = openBids.some(b => Math.abs(b.limitPrice - bidPrice) < 0.003);
-      if (!isDupe && shares > 0) {
-        openBids.push({ id: uuidv4(), shares, filledShares: 0, limitPrice: bidPrice,
-          queuePos: 1 + Math.floor(Math.random()*5), filled: false, postedTick: win.tickCount, postedAt: Date.now() });
-        win[midRefKey] = price;
-      }
-    }
-  }
-}
-
-// ─── EMERGENCY CLOSE ──────────────────────────────────────────────────────────
-async function emergencyClose(win, upP, downP) {
-  const closeLots = async (lots, side, px) => {
-    for (const lot of lots) {
-      if (!lot.filledShares || lot.filledShares <= 0) continue;
-      await execSell(win, side, lot.filledShares, px, 'EMERGENCY', lot.cost ?? lot.filledShares * lot.limitPrice, false);
-    }
-  };
-  await closeLots(win.makerAsksUp,   'UP',   upP);   win.makerAsksUp   = [];
-  await closeLots(win.makerAsksDown, 'DOWN', downP); win.makerAsksDown = [];
-  await closeLots(win.scalpAsksUp,   'UP',   upP);   win.scalpAsksUp   = [];
-  await closeLots(win.scalpAsksDown, 'DOWN', downP); win.scalpAsksDown = [];
-  win.makerBidsUp = []; win.makerBidsDown = [];
-  win.scalpBidsUp = []; win.scalpBidsDown = [];
-}
-
-// ─── STRATEGY RUNNER ──────────────────────────────────────────────────────────
-async function runStrategy(asset) {
-  const win = state.windows[asset];
-  if (!win || win.status !== 'ACTIVE') return;
-  const p  = state.prices[asset];
-  if (!p) return;
-  const sl = secondsLeft();
-
-  if (sl <= CONFIG.EMERGENCY_SECS) { await emergencyClose(win, p.up, p.down); return; }
-
-  // Quote both sides simultaneously
-  await runMakerQuote(win, 'UP',   p.up,   sl);
-  await runMakerQuote(win, 'DOWN', p.down, sl);
-  await runMakerScalp(win, 'UP',   p.up,   sl);
-  await runMakerScalp(win, 'DOWN', p.down, sl);
-}
-
-// ─── WINDOW LIFECYCLE ─────────────────────────────────────────────────────────
-async function startNewWindow(asset) {
-  const ts     = currentWindowTs();
-  const slug   = makeSlug(asset, ts);
-  const tokens = await resolveMarketTokens(slug);
-  const newWin = makeWindowState(asset);
-  newWin.windowTs   = ts;
-  newWin.windowSlug = slug;
-  newWin.marketId   = tokens?.marketId ?? null;
-  newWin.status     = tokens ? 'ACTIVE' : 'WAITING';
-  state.windows[asset] = newWin;
-  if (tokens) log('info', `🪟 WINDOW ACTIVE: ${slug} | cap=$${state.capital.toFixed(2)}`);
-}
-
-async function closeWindow(asset) {
-  const win = state.windows[asset];
-  if (!win?.windowSlug) return;
-  const p = state.prices[asset];
-  await emergencyClose(win, p?.up ?? 0.5, p?.down ?? 0.5);
-
-  state.history.push({
-    asset, slug: win.windowSlug,
-    realizedPnl: win.realizedPnl, feePaid: win.feePaid,
-    tradeCount: win.tradeCount, rebates: win.rebates,
-    closedAt: Date.now(),
-  });
-  if (state.history.length > 200) state.history.shift();
-
-  win.status = 'CLOSED';
-  state.equity.push({ ts: Date.now(), capital: state.settledCapital });
-  if (state.equity.length > 500) state.equity.shift();
-  log('info', `🏁 CLOSED: ${win.windowSlug} | PnL=$${win.realizedPnl.toFixed(2)}`);
-  emitter.emit('state_update', getPublicState());
-}
-
-// ─── PRICE REFRESH (called every 2.5s per asset) ──────────────────────────────
-async function refreshPrices(asset) {
-  const data = await fetchLivePrices(asset);
-  if (!data) return;
-
-  state.prices[asset] = data;
-  globalTick++;
-
-  const win = state.windows[asset];
-  if (win?.status === 'ACTIVE')  await runStrategy(asset);
-  if (win?.status === 'WAITING' && data.up > 0.05 && data.up < 0.95) await startNewWindow(asset);
-
-  emitter.emit('prices', { asset, ...data });
-  emitter.emit('state_update', getPublicState());
-}
-
-// ─── MAIN LOOP ────────────────────────────────────────────────────────────────
-let priceTimers = {}, windowChecker = null;
-
-function startMainLoop() {
-  log('info', `🚀 MM Bot v2.0 | cap=$${CONFIG.DEMO_CAPITAL} | assets=${CONFIG.ASSETS.join(',')}`);
-  log('info', `📡 Prices: gamma-api.polymarket.com + clob.polymarket.com/midpoint`);
-  log('info', `📐 S1 ±2¢ 0.6%/bid | S4 ±2.5¢ 0.4%/bid | Both UP+DOWN sides`);
-
-  CONFIG.ASSETS.forEach(asset => {
-    clearInterval(priceTimers[asset]);
-    priceTimers[asset] = setInterval(() => refreshPrices(asset), CONFIG.PRICE_REFRESH_MS);
-    refreshPrices(asset);  // immediate first fetch
-  });
-
-  clearInterval(windowChecker);
-  windowChecker = setInterval(async () => {
-    const ts = currentWindowTs();
-    for (const asset of CONFIG.ASSETS) {
-      const win = state.windows[asset];
-      if (win.windowTs !== ts) {
-        if (win.windowTs !== null) await closeWindow(asset);
-        await startNewWindow(asset);
-      }
-    }
-  }, 4000);
-}
-
-// ─── PUBLIC STATE ─────────────────────────────────────────────────────────────
-function getPublicState() {
-  const displayCap = parseFloat((state.settledCapital || state.capital).toFixed(2));
-  const totalPnl   = parseFloat((displayCap - state.startCapital).toFixed(2));
-  const wins       = state.history.filter(h => h.realizedPnl > 0).length;
-  const losses     = state.history.filter(h => h.realizedPnl < 0).length;
-
-  const windowsOut = {};
-  CONFIG.ASSETS.forEach(asset => {
-    const win = state.windows[asset];
-    if (!win) return;
-    const p   = state.prices[asset];
-    const openSharesUp   = [...(win.makerAsksUp  || []), ...(win.scalpAsksUp  || [])].reduce((s,l)=>s+(l.filledShares||0),0);
-    const openSharesDown = [...(win.makerAsksDown || []), ...(win.scalpAsksDown|| [])].reduce((s,l)=>s+(l.filledShares||0),0);
-
-    windowsOut[asset] = {
-      status:        win.status,
-      windowSlug:    win.windowSlug,
-      windowTs:      win.windowTs,
-      realizedPnl:   parseFloat((win.realizedPnl||0).toFixed(3)),
-      feePaid:       parseFloat((win.feePaid||0).toFixed(4)),
-      rebates:       parseFloat((win.rebates||0).toFixed(4)),
-      tradeCount:    win.tradeCount,
-      openBidsUp:    (win.makerBidsUp.length + win.scalpBidsUp.length),
-      openBidsDown:  (win.makerBidsDown.length + win.scalpBidsDown.length),
-      openAsksUp:    (win.makerAsksUp.length + win.scalpAsksUp.length),
-      openAsksDown:  (win.makerAsksDown.length + win.scalpAsksDown.length),
-      openSharesUp, openSharesDown,
-      upPrice:       p?.up   ?? null,
-      downPrice:     p?.down ?? null,
-      live:          p?.live ?? false,
-      recentOrders:  (win.orders||[]).slice(-20),
-    };
-  });
+  const allResolved = state.resolvedWindows;
+  const totalWindows= allResolved.length;
+  const profitWindows = allResolved.filter(w => (w.windowPnl || 0) > 0).length;
 
   return {
-    version:     '2.0',
-    mode:        'DEMO',
-    capital:     displayCap,
-    startCapital: state.startCapital,
-    totalPnl, totalReturn: parseFloat((totalPnl / state.startCapital * 100).toFixed(3)),
-    wins, losses, winRate: (wins+losses) > 0 ? ((wins/(wins+losses))*100).toFixed(1) : '0.0',
-    feesPaid:    parseFloat(state.feesPaid.toFixed(4)),
-    rebatesEarned: parseFloat(state.rebatesEarned.toFixed(4)),
-    roundTrips:  state.roundTrips,
-    secsLeft:    secondsLeft(),
-    secsInto:    secondsIntoWindow(),
-    currentTs:   currentWindowTs(),
-    windows:     windowsOut,
-    prices:      state.prices,
-    equity:      state.equity.slice(-120),
-    history:     state.history.slice(-50).reverse(),
-    logs:        state.logs.slice(0, 80),
-    tick:        globalTick,
+    // Capital
+    balance:          fl2(state.balance),
+    startingBalance:  STARTING_BALANCE,
+    totalPnl:         fl4(state.totalPnl),
+    totalRebates:     fl4(state.totalRebates),
+    totalTakerFees:   fl4(state.totalTakerFees),
+    // Window
+    windowElapsed:    elapsed,
+    windowRemaining:  rem,
+    windowStart:      currentWindowStart(),
+    mergeTriggered:   ws ? ws.merged : false,
+    // BTC price
+    btcPrice,
+    // Current window state
+    windowState: ws ? {
+      upToken:      ws.upToken,
+      dnToken:      ws.dnToken,
+      upPrice:      fl2(getMid(ws.upToken || '')),
+      dnPrice:      fl2(getMid(ws.dnToken || '')),
+      upBid:        fl2(getBid(ws.upToken || '')),
+      dnBid:        fl2(getBid(ws.dnToken || '')),
+      upInventory:  ws.upInventory,
+      dnInventory:  ws.dnInventory,
+      upSpent:      ws.upSpent,
+      dnSpent:      ws.dnSpent,
+      upRebates:    ws.upRebates,
+      dnRebates:    ws.dnRebates,
+      upBudgetLeft: ws.upBudgetLeft,
+      dnBudgetLeft: ws.dnBudgetLeft,
+      upBidPlaced:  ws.upBidPlaced,
+      dnBidPlaced:  ws.dnBidPlaced,
+      upFillCount:  ws.upFills.length,
+      dnFillCount:  ws.dnFills.length,
+      upFloatVal,
+      dnFloatVal,
+      // Merge results (if already merged)
+      merged:        ws.merged,
+      matchedPairs:  ws.matchedPairs,
+      mergeProceeds: ws.mergeProceeds,
+      takerUpShares: ws.takerUpShares,
+      takerDnShares: ws.takerDnShares,
+      takerProceeds: ws.takerProceeds,
+      takerFeesPaid: ws.takerFeesPaid,
+      windowPnl:     ws.windowPnl,
+      status:        ws.status,
+      upFills:       ws.upFills.slice(-10),  // last 10 fills
+      dnFills:       ws.dnFills.slice(-10),
+    } : null,
+    // Stats
+    totalWindows,
+    profitWindows,
+    // History
+    pendingWindows:  state.pendingWindows,
+    resolvedWindows: state.resolvedWindows.slice(0, 20),
+    equityCurve,
   };
 }
 
-// ─── SERVER ──────────────────────────────────────────────────────────────────
-const app    = express();
-const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server });
+// ── Main tick ─────────────────────────────────────────────────────────────────
+async function tick(){
+  try {
+    await refreshMarket();
+    await pollPrices();
 
-app.use(cors()); app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
+    ensureWindowState();
 
-function broadcast(type, data) {
-  const msg = JSON.stringify({ type, data, ts: Date.now() });
-  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
+    const ws  = state.windowState;
+    const rem = windowRemaining();
+
+    if (ws && ws.status === 'active'){
+      // Check if any open bids got filled
+      checkFills();
+
+      // If merge window has arrived → do merge
+      if (rem <= MERGE_WINDOW_SECS){
+        doMerge(ws, false);
+      } else {
+        // Post new maker bids if we don't have one on each side and budget remains
+        if (!ws.upBidPlaced && ws.upBudgetLeft >= 1) placeMakerBid('UP');
+        if (!ws.dnBidPlaced && ws.dnBudgetLeft >= 1) placeMakerBid('DOWN');
+      }
+    }
+
+    await checkResolution();
+    emitFn('snapshot', buildSnapshot());
+  } catch(e){ log(`⚠️  tick: ${e.message}`); }
 }
 
-wss.on('connection', ws => {
-  ws.send(JSON.stringify({ type: 'FULL_STATE', data: getPublicState() }));
-  ws.on('error', e => console.error('[WS]', e.message));
-});
-emitter.on('state_update', d => broadcast('STATE_UPDATE', d));
-emitter.on('log',          e => broadcast('LOG', e));
-emitter.on('prices',       p => broadcast('PRICES', p));
+// ── Start ─────────────────────────────────────────────────────────────────────
+async function start(emit, logEmit){
+  emitFn = emit; logFn = logEmit;
+  loadState(); loadEquity();
+  log('🚀 MERGE-ARB MARKET MAKER — BTC 5-min binary');
+  log(`   Maker bids at best_bid+${BID_OFFSET} | Range ${BID_MIN}–${BID_MAX}`);
+  log(`   Budget $${BUDGET_PER_SIDE}/side | Merge at T-${MERGE_WINDOW_SECS}s`);
+  log(`   Maker rebate=${MAKER_REBATE_RATE*100}% | Taker fee=${TAKER_FEE_RATE*100}%`);
+  log(`💰 Balance: $${state.balance.toFixed(2)}`);
+  connectBinance();
+  await tick();
+  setInterval(tick, 2000);
+}
 
-app.get('/api/state',  (_, res) => res.json(getPublicState()));
-app.get('/api/health', (_, res) => res.json({ ok: true, uptime: process.uptime(), tick: globalTick }));
-app.get('*',           (_, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-
-// ─── BOOT ─────────────────────────────────────────────────────────────────────
-initState();
-server.listen(CONFIG.PORT, () => {
-  console.log(`\n╔══════════════════════════════════════════════════╗`);
-  console.log(`║  POLYMARKET MM BOT v2.0                          ║`);
-  console.log(`║  http://localhost:${CONFIG.PORT}                         ║`);
-  console.log(`║  Real prices: clob.polymarket.com/midpoint       ║`);
-  console.log(`╚══════════════════════════════════════════════════╝\n`);
-  startMainLoop();
-});
+module.exports = { start, buildSnapshot };
